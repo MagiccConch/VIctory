@@ -1,14 +1,14 @@
-# victory
+# VIctory fork (work in progress)
 
-A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), the
-compatibility layer that runs the Xbox Series build of the title
-natively on Windows from files the user supplies. This fork follows upstream
+A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
+compatibility layer that runs an Xbox Series title natively on Windows from
+files the user supplies. This fork follows upstream
 `main` and adds fixes aimed at one goal: getting the game's world to render
 correctly and playably on one particular PC.
 
 **This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by the game's publisher or
-Take-Two Interactive.
+copy of the game. It is not affiliated with or endorsed by the game's
+developer or publisher.
 
 ## Credits
 

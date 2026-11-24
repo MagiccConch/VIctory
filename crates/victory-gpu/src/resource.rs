@@ -178,8 +178,8 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
         && let Some(t) = texture_layout(desc)
     {
         // As the console: the layout's own alignment unless more is asked
-        // (4 KiB for 4 KiB modes, where PC says 64 KiB). The title
-        // keeps these sizes in its texture tables, and its streaming
+        // (4 KiB for 4 KiB modes, where PC says 64 KiB).
+        // The title keeps these sizes in its texture tables, and its streaming
         // asserts when they disagree with the streamed layout.
         let alignment = desc.alignment.max(t.alignment);
         if !alignment.is_power_of_two() {
@@ -239,8 +239,8 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 
 /// The format of a texture the host GPU renders to or writes as unordered
 /// access, for the title's `format`. The console's GPU does both with the
-/// 16-bit colour formats B5G5R5A1 (86) and B4G4R4A4 (115), and the title
-/// has full-screen targets in both; a host that refuses either use
+/// 16-bit colour formats B5G5R5A1 (86) and B4G4R4A4 (115), and
+/// the title has full-screen targets in both; a host that refuses either use
 /// (NVIDIA) refused the whole texture, so every pass that wrote it drew
 /// nothing. There 8-bit RGBA stands in: the same channels in the same
 /// order, every 4-bit level exact and every 5-bit level within 1/510.
@@ -327,8 +327,8 @@ pub(crate) fn depth_and_unordered(this: This) -> bool {
 /// when a side is used after the other was written
 /// (`HostList::twin_use`).
 /// shortcut: whole textures are copied, not the mips and slices written.
-/// A depth texture with a stencil plane gets a twin for each plane (the title's
-/// tiled lighting writes each pixel's material class into
+/// A depth texture with a stencil plane gets a twin for each plane (
+/// the title's tiled lighting writes each pixel's material class into
 /// the depth plane and masks into the stencil plane, then draws each class
 /// with the depth test "equal"): the stencil plane's is copied through a
 /// buffer, the depth plane's is drawn into the plane by a pass of ours

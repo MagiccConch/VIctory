@@ -921,8 +921,8 @@ extern "system" fn copy_texture_region(
         let Some(to) = crate::resource::host_resource(dst.resource) else {
             // Texture to buffer: a read back. The list copies the texels
             // into a host buffer of ours; once it has run they go to the
-            // title's buffer (`HostList::defer_read_back`). The title
-            // reads two tiny float targets back every frame (5x1
+            // title's buffer (`HostList::defer_read_back`).
+            // The title reads two tiny float targets back every frame (5x1
             // and 1x1 RGBA32F, 80 and 16 bytes: run 90), and read a buffer
             // nobody wrote. `VICTORY_READ_BACK=0` leaves them unmade, as
             // before.

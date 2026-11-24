@@ -164,8 +164,8 @@ pub enum BvhNodes {
     /// A buffer of the host: the descriptor is loaded from a table (it is
     /// among [`Resources::descriptors`]), and node pointers count from the
     /// buffer's start. Its flags are not known to the shader: boxes are
-    /// sorted and triangles return barycentrics, as every descriptor the title
-    /// builds asks.
+    /// sorted and triangles return barycentrics, as every descriptor
+    /// the title builds asks.
     Resource,
     /// Title memory by address: the code makes the descriptor from numbers
     /// (the title: the whole address space, or one structure's address in
