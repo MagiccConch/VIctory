@@ -14,8 +14,6 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 
-use victory_core::Config;
-
 #[derive(Parser)]
 #[command(
     name = "victory",
