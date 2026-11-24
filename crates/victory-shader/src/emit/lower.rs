@@ -51,6 +51,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// The `dx.op.` functions the program calls (test visibility).
+    #[cfg(test)]
+    pub op_names: Vec<String>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -920,6 +923,8 @@ impl<'a> Lower<'a> {
             heap_props: std::mem::take(&mut self.s.heap_props),
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            op_names: self.s.op_names.clone(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -2036,6 +2041,30 @@ impl<'a> Lower<'a> {
             r = self.s.m.select(c, is, read, r);
         }
         r
+    }
+
+    /// `v_readfirstlane_b32`'s result `first` of `own` in a pixel shader:
+    /// a helper lane takes its own value instead.
+    ///
+    /// On the console, whole-quad mode puts helper lanes in EXEC, so a
+    /// waterfall loop (read the first lane's value, run the lanes with that
+    /// value, take them out of EXEC) serves helper lanes too. On the host,
+    /// wave operations leave helper lanes out (DXIL before
+    /// `WaveOpsIncludeHelperLanes`): once only helper lanes are left in such
+    /// a loop, `WaveReadLaneFirst` reads no lane, no lane matches, and the
+    /// loop runs to [`LOOP_LIMIT`] in every such lane: draws of 0.3 to 1.3 s
+    /// each, then DEVICE_HUNG. With its own value a helper lane matches in
+    /// the first pass and leaves; what a helper lane computes only feeds
+    /// derivatives, and its stores are dropped.
+    fn helper_reads_own(&mut self, own: V, first: V) -> V {
+        if !self.s.pixel {
+            return first;
+        }
+        let c = self.cur;
+        let helper = self
+            .s
+            .op(c, "isHelperLane.i1", Attr::ReadOnly, self.s.t.i1, 221, &[]);
+        self.s.m.select(c, helper, own, first)
     }
 
     fn read_lane(&mut self, x: V, lane: V) -> V {
@@ -4261,6 +4290,7 @@ impl<'a> Lower<'a> {
                     118,
                     &[a],
                 );
+                let r = self.helper_reads_own(a, r);
                 int(self, r)
             }
             _ => {
@@ -6976,6 +7006,7 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::container::SigElement;
     use super::{GLOBALLY_COHERENT, Lowered, Numeric, Parts, buffer_format, half_shift, lower};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -7128,9 +7159,7 @@ mod tests {
             S_ENDPGM,
         ];
 
-        let code: Vec<u8> = words.iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect();
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
 
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -7147,9 +7176,12 @@ mod tests {
 
         let p = ir::build(&native.code, false, 256).unwrap();
 
-        assert!(p.blocks.iter()
-            .flat_map(|b| &b.insts)
-            .any(|i| i.name() == "v_perm_b32"));
+        assert!(
+            p.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| i.name() == "v_perm_b32")
+        );
 
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
@@ -7166,13 +7198,12 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
-        }).unwrap();
+        })
+        .unwrap();
 
-        let container =
-            crate::Container::parse(&emitted.dxil).unwrap();
+        let container = crate::Container::parse(&emitted.dxil).unwrap();
 
-        let features =
-            container.part(crate::FourCC::SFI0).unwrap();
+        let features = container.part(crate::FourCC::SFI0).unwrap();
 
         u64::from_le_bytes(features.data.try_into().unwrap())
     }
@@ -7334,6 +7365,111 @@ mod tests {
                 .iter()
                 .all(|p| p & GLOBALLY_COHERENT == 0)
         );
+    }
+
+    /// The ops named in a program's emitted DXIL.
+    fn dxil_names(emitted: &Lowered, needle: &str) -> bool {
+        emitted.op_names.iter().any(|n| n.contains(needle))
+    }
+
+    /// A program reading a per-lane VGPR (`v0`: the thread id in compute,
+    /// the position's x in the pixel shader) through `v_readfirstlane_b32`,
+    /// then storing the result where it has an effect: the depth output in
+    /// the pixel shader, an LDS store in the compute shader.
+    fn readfirstlane_words(pixel: bool) -> Vec<u32> {
+        let mut words = vec![0x7E08_0500u32]; // v_readfirstlane_b32 s4, v0
+        if pixel {
+            words.extend([
+                0x7E02_0204, // v_mov_b32 v1, s4
+                0xF800_1881,
+                0x0000_0001, // exp mrtz v1, off, off, off done vm
+            ]);
+        } else {
+            words.extend([
+                0x7E04_0204, // v_mov_b32 v2, s4
+                0xD834_0000,
+                0x0000_0200, // ds_write_b32 v0, v2
+            ]);
+        }
+        words.push(S_ENDPGM);
+        words
+    }
+
+    /// [`lower_with`] for a pixel program reading the position's x in v0
+    /// (`SPI_PS_INPUT_ADDR` bit 8) and exporting it as SV_Depth.
+    fn lower_ps(words: &[u32]) -> Result<Lowered, crate::ShaderError> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 1 << 8,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code,
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![SigElement {
+                name: "SV_Position".into(),
+                index: 0,
+                kind: 3,
+                comp: 9,
+                interp: 0,
+                row: None,
+                col: 0,
+                cols: 4,
+                usage: 1,
+                half: false,
+            }],
+            outputs: vec![SigElement {
+                name: "SV_Depth".into(),
+                index: 0,
+                kind: 17,
+                comp: 9,
+                interp: 0,
+                row: None,
+                col: 0,
+                cols: 1,
+                usage: 1,
+                half: false,
+            }],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+    }
+
+    #[test]
+    fn a_pixel_helper_lane_reads_its_own_value() {
+        // Whole-quad mode keeps helper lanes in the console's EXEC, so a
+        // waterfall loop serves them; host wave ops leave them out, and
+        // once only they remain, WaveReadLaneFirst reads no lane and the
+        // loop runs to the iteration limit (issue #908). A helper lane
+        // therefore reads its own value.
+        let emitted = lower_ps(&readfirstlane_words(true)).unwrap();
+        assert!(dxil_names(&emitted, "dx.op.waveReadLaneFirst"));
+        assert!(dxil_names(&emitted, "dx.op.isHelperLane"));
+    }
+
+    #[test]
+    fn a_compute_readfirstlane_keeps_wave_read_lane_first() {
+        // Other stages have no helper lanes: the read stays whole-wave.
+        let emitted = lower_with(&readfirstlane_words(false), vec![], vec![]).unwrap();
+        assert!(dxil_names(&emitted, "dx.op.waveReadLaneFirst"));
+        assert!(!dxil_names(&emitted, "dx.op.isHelperLane"));
     }
 
     /// Tables of 2D textures at s0 and samplers at s1.

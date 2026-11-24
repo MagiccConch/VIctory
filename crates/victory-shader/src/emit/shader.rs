@@ -71,6 +71,9 @@ pub(crate) struct Shader {
     /// The first word of every heap handle's properties (test visibility).
     #[cfg(test)]
     pub heap_props: Vec<u32>,
+    /// The `dx.op.` functions the program calls (test visibility).
+    #[cfg(test)]
+    pub op_names: Vec<String>,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -127,6 +130,8 @@ impl Shader {
             nonuniform_handles: 0,
             #[cfg(test)]
             heap_props: Vec::new(),
+            #[cfg(test)]
+            op_names: Vec::new(),
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -165,6 +170,8 @@ impl Shader {
         let f = self
             .m
             .function(&format!("dx.op.{name}"), fty, Some(attr), false);
+        #[cfg(test)]
+        self.op_names.push(format!("dx.op.{name}"));
         let mut all = vec![self.m.i32(opcode)];
         all.extend(args);
         self.m.call(block, f, all)
