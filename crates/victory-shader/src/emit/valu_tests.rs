@@ -504,7 +504,7 @@ fn v_cvt_f32_u32_matches_the_reference_rounding() {
     ];
     let inputs: Vec<[u32; 4]> = cases.iter().map(|&(x, _)| [x, 0, 0, 0]).collect();
     run_cases(&shader, &inputs, |backend, i, inp, got| {
-        let want = f32::from_bits(inp[0]) as f64 as f32;
+        let want = inp[0] as f64 as f32;
         assert_eq!(
             f32::to_bits(want),
             [0x3F80_0000u32, 0x4F00_0000, 0x4F5E_8497, 0x4F80_0000][i],
