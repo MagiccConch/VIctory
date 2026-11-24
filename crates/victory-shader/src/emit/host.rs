@@ -65,6 +65,24 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+/// The adapter a device runs on, as DXGI names it: what verdicts about
+/// a host speak of as "the GPU".
+pub fn adapter_name(device: &ID3D12Device) -> String {
+    // SAFETY: plain DXGI queries.
+    unsafe {
+        device
+            .cast::<IDXGIDevice>()
+            .and_then(|d| d.GetAdapter())
+            .and_then(|adapter| adapter.cast::<IDXGIAdapter1>())
+            .and_then(|adapter| adapter.GetDesc1())
+            .map_or("unknown adapter".to_owned(), |desc| {
+                String::from_utf16_lossy(&desc.Description)
+                    .trim_end_matches('\0')
+                    .to_owned()
+            })
+    }
+}
+
 impl Host {
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
@@ -81,20 +99,9 @@ impl Host {
                 D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             }
             let device = device.ok_or("no device")?;
-            // SAFETY: plain DXGI queries; the closures run inside the
-            // unsafe block above.
             // The device's own adapter, so the name is honest whether the
             // default was picked or WARP was asked for.
-            let name = device
-                .cast::<IDXGIDevice>()
-                .and_then(|d| d.GetAdapter())
-                .and_then(|adapter| adapter.cast::<IDXGIAdapter1>())
-                .and_then(|adapter| adapter.GetDesc1())
-                .map_or("unknown adapter".to_owned(), |desc| {
-                    String::from_utf16_lossy(&desc.Description)
-                        .trim_end_matches('\0')
-                        .to_owned()
-                });
+            let name = adapter_name(&device);
             let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
                 HighestShaderModel: D3D_SHADER_MODEL_6_6,
             };

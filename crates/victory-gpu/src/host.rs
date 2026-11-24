@@ -226,6 +226,7 @@ fn create() -> windows::core::Result<Host> {
         // host chooses (the RX 6700 XT does, WARP does not).
         match (victory_shader::emit::host::Host {
             device: device.clone(),
+            name: victory_shader::emit::host::adapter_name(&device),
         })
         .fuses_fmad()
         {
