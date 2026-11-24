@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::policy::ensure_outside_repo;
+use crate::policy::{PolicyError, ensure_outside_repo};
 
 #[derive(Debug, Default, Clone)]
 pub struct Config {
@@ -117,6 +117,24 @@ impl Config {
     pub fn data_subdir(&self, sub: &str) -> Result<PathBuf> {
         subdir(&self.data_dir, sub)
     }
+
+    /// Every configured path that violates the asset policy, with the reason.
+    ///
+    /// `victory config` reports these and fails; other tools can share it.
+    pub fn policy_violations(&self) -> Vec<(PathBuf, PolicyError)> {
+        let mut violations = Vec::new();
+        for p in self
+            .game_dir
+            .iter()
+            .chain(&self.test_titles)
+            .chain([&self.cache_dir, &self.data_dir])
+        {
+            if let Err(e) = ensure_outside_repo(p) {
+                violations.push((p.clone(), e));
+            }
+        }
+        violations
+    }
 }
 
 fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
@@ -213,5 +231,37 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.data_subdir("x").is_err());
+    }
+
+    #[test]
+    fn policy_violations_lists_inside_repo_paths() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join(crate::policy::ROOT_MARKER), b"").unwrap();
+        let inside = repo.path().join("game");
+        std::fs::create_dir(&inside).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            game_dir: Some(inside),
+            cache_dir: outside.path().join("cache"),
+            data_dir: outside.path().join("data"),
+            test_titles: vec![outside.path().join("other")],
+            source: None,
+        };
+        let violations = cfg.policy_violations();
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].0, cfg.game_dir.unwrap());
+    }
+
+    #[test]
+    fn policy_violations_empty_when_all_outside() {
+        let outside = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            game_dir: Some(outside.path().join("game")),
+            cache_dir: outside.path().join("cache"),
+            data_dir: outside.path().join("data"),
+            test_titles: vec![outside.path().join("other")],
+            source: None,
+        };
+        assert!(cfg.policy_violations().is_empty());
     }
 }

@@ -14,6 +14,8 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 
+use victory_core::Config;
+
 #[derive(Parser)]
 #[command(
     name = "victory",
@@ -184,17 +186,20 @@ fn show_config() -> Result<()> {
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }
-    for p in cfg
-        .game_dir
-        .iter()
-        .chain(&cfg.test_titles)
-        .chain([&cfg.cache_dir, &cfg.data_dir])
-    {
-        if let Err(e) = victory_core::ensure_outside_repo(p) {
-            println!("POLICY VIOLATION: {e}");
-        }
+    let violations = cfg.policy_violations();
+    for (_, e) in &violations {
+        println!("POLICY VIOLATION: {e}");
     }
-    Ok(())
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "{} configured path{} violate{} the asset policy (see docs/asset-policy.md)",
+            violations.len(),
+            if violations.len() == 1 { "" } else { "s" },
+            if violations.len() == 1 { "s" } else { "" },
+        ))
+    }
 }
 
 /// Paths given on the command line, or the configured game + test titles.

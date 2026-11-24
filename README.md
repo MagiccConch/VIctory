@@ -59,7 +59,7 @@ the Windows paging file size, then retry.
 cargo xtask install-hooks                # asset-policy check on every commit
 copy victory.example.toml victory.toml   # then set your paths (outside the repo)
 cargo test --workspace                   # needs no game data
-cargo run -p victory -- config           # check your paths
+cargo run -p victory -- config           # check your paths; nonzero exit if a path violates the asset policy
 ```
 
 Run the title:
