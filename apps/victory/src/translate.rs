@@ -161,6 +161,7 @@ pub fn run(
 ) -> Result<()> {
     let paths = crate::default_paths(paths)?;
     let dll = validate.then(Validator::default_path).flatten();
+    let mut device_name: Option<String> = None;
     if validate {
         Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;
         println!(
@@ -169,15 +170,17 @@ pub fn run(
                 .map_or("dxil.dll".into(), |p| p.display().to_string())
         );
     }
-    if pipelines {
-        Host::new(false).map_err(anyhow::Error::msg)?;
-    }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
         .split(',')
         .filter_map(|p| p.split_once('+'))
         .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned()))
         .collect();
+    if pipelines || !pairs.is_empty() {
+        Host::new(false)
+            .map(|h| device_name.insert(h.name))
+            .map_err(anyhow::Error::msg)?;
+    }
     let kept = std::sync::Arc::new(Mutex::new(Vec::new()));
     let threads =
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
@@ -270,8 +273,12 @@ pub fn run(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
+    if let Some(name) = &device_name {
+        println!("device       {name}");
+    }
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
+        device_name.get_or_insert(host.name.clone());
         let kept = lock(&kept);
         let find = |name: &str| kept.iter().find(|(l, _)| l.contains(name));
         for (v, p) in &pairs {
