@@ -22,6 +22,11 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 type Why = &'static str;
 
+/// `IsGloballyCoherent`, the props bit (DxilResourceProperties.h, 0x4000)
+/// that stops a UAV access from being cached per CU, the way the console's
+/// `glc` does.
+const GLOBALLY_COHERENT: u32 = 0x4000;
+
 #[derive(Debug, Clone, Copy)]
 enum Val {
     I32(V),
@@ -40,6 +45,9 @@ pub(crate) struct Lowered {
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
+    /// The first word of every heap handle's properties.
+    #[cfg(test)]
+    pub heap_props: Vec<u32>,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -908,6 +916,8 @@ impl<'a> Lower<'a> {
             root_srvs,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
+            #[cfg(test)]
+            heap_props: std::mem::take(&mut self.s.heap_props),
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             dxil: self.s.finish(),
@@ -5646,11 +5656,22 @@ impl<'a> Lower<'a> {
             .copied()
             .ok_or("an untracked image")?;
         let store = name.starts_with("image_store");
+        // Atomics need a UAV, as do stores (and `u` reuses their flag).
         let uav = store
+            || name.starts_with("image_atomic_")
             || self
                 .used_kind(src)
                 .is_some_and(|u| u.kind == ResourceType::Uav);
-        let props = (kind | if uav { 0x1000 } else { 0 }, 0x409);
+        // A `glc` access reaches every CU (issue #725): mark the UAV
+        // globally coherent, or its waits may never see another wave's
+        // writes. Reads of a plain SRV keep their descriptor's kind.
+        let glc = uav && matches!(inst.fields, Fields::Image { cache, .. } if cache.glc);
+        let u = if uav {
+            0x1000 | if glc { GLOBALLY_COHERENT } else { 0 }
+        } else {
+            0
+        };
+        let props = (kind | u, 0x409);
         if let Some(op) = name.strip_prefix("image_atomic_") {
             // DXIL's atomic operations on a 32-bit integer texture UAV; the
             // old value returns with glc. Sub is the add of the negation.
@@ -5697,7 +5718,7 @@ impl<'a> Lower<'a> {
                 Some(v) if cache.glc => self.i32_of(v)?,
                 _ => self.s.m.i32(0),
             };
-            let h = self.handle(site, src, false, (kind | 0x1000, 0x105))?;
+            let h = self.handle(site, src, false, (kind | u, 0x105))?;
             let at = self.begin_guarded(guard);
             let i32t = self.s.t.i32;
             let mut args = vec![h];
@@ -6270,7 +6291,15 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
+        // A `glc` access reaches every CU (issue #725): mark the UAV
+        // globally coherent, or its waits may never see another wave's
+        // writes. Reads of a plain SRV keep their descriptor's kind.
+        let glc = uav && matches!(inst.fields, Fields::Buffer { cache, .. } if cache.glc);
+        let u = if uav {
+            0x1000 | if glc { GLOBALLY_COHERENT } else { 0 }
+        } else {
+            0
+        };
         let iu = self.s.m.undef(self.s.t.i32);
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
@@ -6947,7 +6976,7 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
+    use super::{GLOBALLY_COHERENT, Lowered, Numeric, Parts, buffer_format, half_shift, lower};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
@@ -7198,6 +7227,113 @@ mod tests {
             }]
         };
         lower_with(&words, layout(), used()).unwrap();
+    }
+
+    /// The used resources of a table at s0 holding one view of `kind`.
+    fn table_used(kind: ResourceType, stride: u32, dwords: u8) -> Vec<UsedResource> {
+        vec![UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride,
+            dwords,
+            user_data: 0,
+            slot: 0,
+        }]
+    }
+
+    /// One descriptor loaded from the table at s0 and read through by
+    /// index, with (`glc`) or without the globally-coherent modifier.
+    fn buffer_load_words(glc: bool) -> [u32; 9] {
+        [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            if glc { 0xE030_6000 } else { 0xE030_2000 },
+            0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 idxen [glc]
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ]
+    }
+
+    #[test]
+    fn a_glc_buffer_load_marks_its_uav_globally_coherent() {
+        let layout = || vec![root(RootType::Table, 0, 0)];
+        let uav = || table_used(ResourceType::Uav, 4, 4);
+        let emitted = lower_with(&buffer_load_words(true), layout(), uav()).unwrap();
+        // An indexed structured read: kind 12, with the UAV flag and
+        // `IsGloballyCoherent`.
+        assert!(
+            emitted
+                .heap_props
+                .contains(&(12 | 0x1000 | GLOBALLY_COHERENT))
+        );
+        let emitted = lower_with(&buffer_load_words(false), layout(), uav()).unwrap();
+        assert!(emitted.heap_props.contains(&(12 | 0x1000)));
+        assert!(
+            emitted
+                .heap_props
+                .iter()
+                .all(|p| p & GLOBALLY_COHERENT == 0)
+        );
+    }
+
+    #[test]
+    fn a_glc_buffer_load_leaves_a_plain_srv_alone() {
+        // A `glc` read of a descriptor known only as an SRV keeps its
+        // descriptor's kind; promoting heap descriptors is #724's work.
+        let emitted = lower_with(
+            &buffer_load_words(true),
+            vec![root(RootType::Table, 0, 0)],
+            table_used(ResourceType::Srv, 4, 4),
+        )
+        .unwrap();
+        assert!(emitted.heap_props.contains(&12));
+        assert!(
+            emitted
+                .heap_props
+                .iter()
+                .all(|p| p & GLOBALLY_COHERENT == 0)
+        );
+    }
+
+    #[test]
+    fn a_glc_image_load_marks_its_uav_globally_coherent() {
+        // One 2D image descriptor loaded from the table at s0, read with
+        // (and without) the globally-coherent modifier.
+        let words = |glc: bool| {
+            [
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF40C_0202,
+                0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], null
+                if glc { 0xF000_2F08 } else { 0xF000_0F08 },
+                0x0042_0002, // image_load v[0:3], v[2:3], s[8:15] [glc]
+                0xD834_0000,
+                0x0000_0000, // ds_write_b32 v0, v0
+                S_ENDPGM,
+            ]
+        };
+        let layout = || vec![root(RootType::Table, 0, 0)];
+        let uav = || table_used(ResourceType::Uav, 0, 8);
+        let emitted = lower_with(&words(true), layout(), uav()).unwrap();
+        // A 2D image's props kind is 2.
+        assert!(
+            emitted
+                .heap_props
+                .contains(&(2 | 0x1000 | GLOBALLY_COHERENT))
+        );
+        let emitted = lower_with(&words(false), layout(), uav()).unwrap();
+        assert!(emitted.heap_props.contains(&(2 | 0x1000)));
+        assert!(
+            emitted
+                .heap_props
+                .iter()
+                .all(|p| p & GLOBALLY_COHERENT == 0)
+        );
     }
 
     /// Tables of 2D textures at s0 and samplers at s1.
