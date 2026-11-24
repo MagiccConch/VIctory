@@ -288,8 +288,20 @@ pub(crate) struct HostPipeline {
     pub(crate) name: String,
 }
 
-/// Logs a pipeline that gets no host pipeline, once per reason.
+// The reason the last `HostPipeline::new` on this thread made nothing, for
+// the pre-build's per-cause report (the run logs refuse, the pre-build is
+// quiet).
+thread_local! {
+    static REFUSAL: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The reason `HostPipeline::new` (last call on this thread) made nothing.
+pub(crate) fn refusal() -> Option<String> {
+    REFUSAL.with(|r| r.borrow().clone())
+}
+
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
+    REFUSAL.with(|r| *r.borrow_mut() = Some(reason.to_owned()));
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.contains(&reason) {
@@ -299,10 +311,23 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
     None
 }
 
+fn refused(what: &str, e: windows::core::Error, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
+    REFUSAL.with(|r| *r.borrow_mut() = Some(format!("{what}: {e}")));
+    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let reason = REFUSAL.with(|r| r.borrow().clone().unwrap_or_default());
+    if !seen.contains(&reason) {
+        seen.push(reason.clone());
+        tracing::warn!(?shaders, "no host pipeline: {reason} (logged once)");
+    }
+    None
+}
+
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
+        REFUSAL.with(|r| *r.borrow_mut() = None);
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
         let compute = match shaders {
             [cs] if cs.stage == "compute" => Some(cs),
@@ -465,10 +490,7 @@ impl HostPipeline {
         }
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
-            Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host root signature refused");
-                return None;
-            }
+            Err(e) => return refused("root signature", e, shaders),
         };
         let code = |i: usize| {
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
@@ -497,7 +519,7 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                    refused("compute pipeline", e, shaders);
                     host.log_messages();
                     return None;
                 }
@@ -530,7 +552,7 @@ impl HostPipeline {
             let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name) {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
+                    refused("mesh pipeline", e, shaders);
                     host.log_messages();
                     return None;
                 }
@@ -605,7 +627,7 @@ impl HostPipeline {
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                refused("graphics pipeline", e, shaders);
                 host.log_messages();
                 return None;
             }

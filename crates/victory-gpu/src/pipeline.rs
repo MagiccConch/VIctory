@@ -656,7 +656,7 @@ impl Prebuild {
             Some(_) => Ok(()),
             None => Err(match self.shaders.iter().find(|s| s.translated().is_none()) {
                 Some(s) => format!("{} shader does not translate", s.stage),
-                None => "the host refuses it".into(),
+                None => host::refusal().unwrap_or_else(|| "the host refuses it".into()),
             }),
         }
     }
