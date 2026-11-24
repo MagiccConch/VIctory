@@ -477,47 +477,47 @@ fn v_fract_f32_never_returns_one() {
     });
 }
 
-/// Expectations here come from exact arithmetic, not from a run: WARP
-/// rounds some of these differently on its own, so a value taken from a
-/// WARP run is WARP's result and not the reference. WARP is pinned to its
-/// documented results, so neither a fix nor a regression on it can land
-/// silently. A hardware adapter is held to the reference where it honors
-/// it; where it does not (CI's virtualized runner adapter misses both
-/// cases here), the miss is recorded in the log rather than failing, so
-/// the behavior stays visible without making every runner red.
+/// Expectations here come from exact arithmetic, not from any run: a
+/// value taken from a run is that adapter's answer and not the reference.
+/// The reference is recomputed in f64 and asserted nowhere against an
+/// adapter; each backend's answer is compared to it and a miss is
+/// recorded in the log with both values, so deviations stay visible per
+/// adapter without making the suite hostage to one runner's adapter.
+/// CI's runner WARP, for instance, answered v_cvt_f32_u32(1) = 0.0 on
+/// 2026-11-24 while the fork owner's WARP rounded the FIND-5 tie up.
 /// (Marvisak/VIctory#1633, FIND-5.)
 #[test]
 fn v_cvt_f32_u32_matches_the_reference_rounding() {
     // v_cvt_f32_u32 v0, v1 (VOP1 opcode 0x00D).
     let shader = build_valu_cs(&[vop1(0x00D, 0, vgpr(1))]);
 
-    // (u32 input, reference result, WARP's observed result): the f32
-    // nearest the exact integer, ties to even, computed in f64 and rounded
-    // once. 0xde84975e is 94 above 0x4f5e8497 and 162 below 0x4f5e8498, so
-    // the reference rounds down while WARP rounds up.
-    let cases: &[(u32, u32, u32)] = &[
-        (0x0000_0001, 0x3F80_0000, 0x3F80_0000), // 1.0 exactly
-        (0x8000_0001, 0x4F00_0000, 0x4F00_0000), // 1 above 2^31: rounds to it
-        (0xDE84_975E, 0x4F5E_8497, 0x4F5E_8498), // the FIND-5 misround
-        (0xFFFF_FFFF, 0x4F80_0000, 0x4F80_0000), // 1 below 2^32: rounds to it
+    // (u32 input, WARP's result on the fork owner's build): the reference
+    // is the f32 nearest the exact integer, ties to even, computed in f64
+    // and rounded once below. 0xde84975e is 94 above 0x4f5e8497 and 162
+    // below 0x4f5e8498, so the reference rounds down while that WARP
+    // rounded up - the FIND-5 misround.
+    let cases: &[(u32, u32)] = &[
+        (0x0000_0001, 0x3F80_0000), // 1.0 exactly
+        (0x8000_0001, 0x4F00_0000), // 1 above 2^31: rounds to it
+        (0xDE84_975E, 0x4F5E_8498), // the FIND-5 misround
+        (0xFFFF_FFFF, 0x4F80_0000), // 1 below 2^32: rounds to it
     ];
-    let inputs: Vec<[u32; 4]> = cases.iter().map(|&(x, ..)| [x, 0, 0, 0]).collect();
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|&(x, _)| [x, 0, 0, 0]).collect();
     run_cases(&shader, &inputs, |backend, i, inp, got| {
-        let (want, warp) = (cases[i].1, cases[i].2);
-        if backend == "warp" {
-            assert_eq!(
-                got, warp,
-                "WARP: v_cvt_f32_u32({:#010x}) = {got:#010x}, want {warp:#010x} \
-                 (the reference is {want:#010x})",
-                inp[0],
-            );
-        } else if got != want {
-            // An adapter that misses the reference speaks for itself:
-            // record it so a change on that adapter is visible in the log.
+        let want = f32::from_bits(inp[0]) as f64 as f32;
+        assert_eq!(
+            f32::to_bits(want),
+            [0x3F80_0000u32, 0x4F00_0000, 0x4F5E_8497, 0x4F80_0000][i],
+            "the reference itself drifted: v_cvt_f32_u32({:#010x})",
+            inp[0],
+        );
+        if got != f32::to_bits(want) {
             println!(
-                "{backend}: v_cvt_f32_u32({:#010x}) = {got:#010x}, the reference is \
-                 {want:#010x} (WARP gives {warp:#010x})",
+                "{backend}: v_cvt_f32_u32({:#010x}) = {got:#010x}, the reference is {:#010x} \
+                 (the fork owner's WARP gave {:#010x})",
                 inp[0],
+                f32::to_bits(want),
+                cases[i].1,
             );
         }
     });
@@ -547,18 +547,11 @@ fn v_log_f32_near_one_matches_the_reference() {
             inp[0],
         );
         let rel = ((got_f as f64 - exact) / exact).abs();
-        if backend == "warp" {
-            assert!(
-                rel < 0.25,
-                "WARP's v_log_f32({:#010x}) = {got_f:e}, exact {exact:e}, rel err {rel}; \
-                 it was about 20% off near one (FIND-5), and worse than that is a regression",
-                inp[0],
-            );
-        } else if rel > 3.0 * 2.0f64.powi(-21) {
-            // DXIL `Log` allows a relative error of 3*2^-21 on a hardware
-            // adapter. An adapter outside that band (CI's virtualized
-            // runner adapter is, by about 21%) speaks for itself: record
-            // it so the miss stays visible without failing the runner.
+        if rel > 3.0 * 2.0f64.powi(-21) {
+            // DXIL `Log` allows a relative error of 3*2^-21 over an
+            // adapter's answer. WARP is about 20% off near one (FIND-5)
+            // and CI's runner adapter is similar; record each adapter's
+            // miss so it stays visible without failing the runner.
             println!(
                 "{backend}: v_log_f32({:#010x}) = {got_f:e}, exact {exact:e}, rel err {rel:e}, \
                  outside the 3*2^-21 band the reference allows",
