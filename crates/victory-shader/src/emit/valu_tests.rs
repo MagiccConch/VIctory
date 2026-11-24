@@ -477,6 +477,84 @@ fn v_fract_f32_never_returns_one() {
     });
 }
 
+/// Expectations here come from exact arithmetic, not from a run: WARP
+/// rounds some of these differently on its own, so a value taken from a
+/// WARP run is WARP's result and not the reference. A hardware adapter
+/// must match the reference; WARP must keep its documented deviation, so
+/// neither a fix nor a regression on it can land silently.
+/// (Marvisak/VIctory#1633, FIND-5.)
+#[test]
+fn v_cvt_f32_u32_matches_the_reference_rounding() {
+    // v_cvt_f32_u32 v0, v1 (VOP1 opcode 0x00D).
+    let shader = build_valu_cs(&[vop1(0x00D, 0, vgpr(1))]);
+
+    // (u32 input, reference result, WARP's observed result): the f32
+    // nearest the exact integer, ties to even, computed in f64 and rounded
+    // once. 0xde84975e is 94 above 0x4f5e8497 and 162 below 0x4f5e8498, so
+    // the reference rounds down while WARP rounds up.
+    let cases: &[(u32, u32, u32)] = &[
+        (0x0000_0001, 0x3F80_0000, 0x3F80_0000), // 1.0 exactly
+        (0x8000_0001, 0x4F00_0000, 0x4F00_0000), // 1 above 2^31: rounds to it
+        (0xDE84_975E, 0x4F5E_8497, 0x4F5E_8498), // the FIND-5 misround
+        (0xFFFF_FFFF, 0x4F80_0000, 0x4F80_0000), // 1 below 2^32: rounds to it
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|&(x, ..)| [x, 0, 0, 0]).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let (want, warp) = (cases[i].1, cases[i].2);
+        let expect = if backend == "warp" { warp } else { want };
+        assert_eq!(
+            got, expect,
+            "{backend}: v_cvt_f32_u32({:#010x}) = {got:#010x}, want {expect:#010x} \
+             (the reference is {want:#010x})",
+            inp[0],
+        );
+    });
+}
+
+#[test]
+fn v_log_f32_near_one_matches_the_reference() {
+    // v_log_f32 v0, v1 (VOP1 opcode 0x027; DXIL unary.f32 op 23, `Log`).
+    let shader = build_valu_cs(&[vop1(0x027, 0, vgpr(1))]);
+    let f = f32::to_bits;
+
+    // (input, the exact f64 log2 of it): log2(1-2^-24) is the FIND-5 case
+    // where WARP lands about 20% off.
+    let cases: &[(u32, f64)] = &[
+        (f(1.0 - 2.0f32.powi(-24)), -8.599_132_799_414_561_7e-08),
+        (f(0.5), -1.0),
+        (f(2.0), 1.0),
+        (f(1.0e10), f64::from(f32::log2(1.0e10))),
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|&(x, _)| [x, 0, 0, 0]).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let exact = cases[i].1;
+        let got_f = f32::from_bits(got);
+        assert!(
+            !got_f.is_nan(),
+            "{backend}: v_log_f32({:#010x}) = NaN, want near {exact:e}",
+            inp[0],
+        );
+        let rel = ((got_f as f64 - exact) / exact).abs();
+        if backend == "warp" {
+            assert!(
+                rel < 0.25,
+                "WARP's v_log_f32({:#010x}) = {got_f:e}, exact {exact:e}, rel err {rel}; \
+                 it was about 20% off near one (FIND-5), and worse than that is a regression",
+                inp[0],
+            );
+        } else {
+            // DXIL `Log` allows a relative error of 3*2^-21 on a hardware
+            // adapter; the reference has to sit inside that.
+            assert!(
+                rel <= 3.0 * 2.0f64.powi(-21),
+                "{backend}: v_log_f32({:#010x}) = {got_f:e}, exact {exact:e}, rel err {rel:e}, \
+                 want within 3*2^-21 of the reference",
+                inp[0],
+            );
+        }
+    });
+}
+
 #[test]
 fn v_fract_f16_never_returns_one() {
     // v_fract_f16 v0, v1 (VOP1 opcode 0x05f)
