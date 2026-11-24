@@ -185,6 +185,11 @@ pub extern "system" fn XApuConnect(
     } else {
         std::ptr::null_mut()
     };
+    if event.is_null() && input.options & RESULT_EVENT != 0 {
+        // SAFETY: allocated above with the same layout, never handed out.
+        unsafe { std::alloc::dealloc(memory, layout) };
+        return E_OUTOFMEMORY;
+    }
     let streams = input.streams as usize;
     tracing::info!(
         streams,
@@ -271,9 +276,11 @@ pub extern "system" fn XApuEnqueueCommand(
             tracing::debug!(stream, channels, "Opus stream activated");
             result.error = if decoder.is_some() {
                 ALREADY_ACTIVE
+            } else if !(1..=2).contains(&channels) {
+                E_INVALIDARG
             } else {
                 match OpusDecoder::new(48_000, channels as usize) {
-                    Ok(d) if (1..=2).contains(&channels) => {
+                    Ok(d) => {
                         *decoder = Some(d);
                         S_OK
                     }
@@ -340,14 +347,24 @@ fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &
         .min(command.frame_count as usize)
         .min(output_length as usize / (4 * channels));
     let kept = &pcm[first * channels..(first + frames) * channels];
-    // SAFETY: the title's output buffer holds `output_length` bytes.
-    let out = unsafe { std::slice::from_raw_parts_mut(output.cast::<f32>(), frames * channels) };
-    if options & DEINTERLEAVED_OUTPUT != 0 && channels == 2 {
-        for (i, frame) in kept.as_chunks::<2>().0.iter().enumerate() {
-            (out[i], out[frames + i]) = (frame[0], frame[1]);
+    // The command is `#[repr(C, packed)]`, so `output` carries no alignment
+    // guarantee; write through a byte view instead of aliasing an `f32`
+    // slice (`from_raw_parts_mut::<f32>` is UB on a misaligned pointer, even
+    // when empty). The console and the host are both little-endian.
+    if frames > 0 {
+        // SAFETY: the title's output buffer holds `output_length` bytes, at
+        // least the `frames * channels * 4` written here.
+        let out = unsafe { std::slice::from_raw_parts_mut(output, frames * channels * 4) };
+        if options & DEINTERLEAVED_OUTPUT != 0 && channels == 2 {
+            for (i, frame) in kept.as_chunks::<2>().0.iter().enumerate() {
+                out[i * 4..][..4].copy_from_slice(&frame[0].to_le_bytes());
+                out[(frames + i) * 4..][..4].copy_from_slice(&frame[1].to_le_bytes());
+            }
+        } else {
+            for (chunk, sample) in out.as_chunks_mut::<4>().0.iter_mut().zip(kept) {
+                *chunk = sample.to_le_bytes();
+            }
         }
-    } else {
-        out.copy_from_slice(kept);
     }
     result.frames = frames as u32;
     result.output_length = (frames * channels * 4) as u32;
@@ -520,5 +537,134 @@ mod tests {
         let error = unsafe { result.assume_init() }.error;
         assert_eq!(error, INVALID_STREAM);
         assert_eq!(XApuDisconnect(handle), S_OK);
+    }
+
+    /// The `Process` command is packed, so its `output` pointer carries no
+    /// alignment guarantee. Decoding into a misaligned pointer must not abort
+    /// and must produce the same bytes as an aligned decode.
+    #[test]
+    fn decodes_into_unaligned_output_interleaved_and_deinterleaved() {
+        // A 20 ms stereo packet of a 440 Hz tone.
+        let tone: Vec<f32> = (0..960 * 2)
+            .map(|i| ((i / 2) as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.5)
+            .collect();
+        let mut encoder = OpusEncoder::new(48_000, 2, Application::Audio).unwrap();
+        let mut packet = [0u8; 1500];
+        let n = encoder.encode(&tone, 960, &mut packet).unwrap();
+        let mut interleaved: Option<Vec<u8>> = None;
+
+        for options in [0, DEINTERLEAVED_OUTPUT] {
+            let input = ConnectInput {
+                process: DECODE_OPUS,
+                streams: 8,
+                commands_per_stream: 2,
+                memory: 0x10_4000,
+                frames_per_output: 0,
+                options,
+            };
+            let mut output = ConnectOutput {
+                memory: std::ptr::null_mut(),
+                result_event: std::ptr::null_mut(),
+            };
+            let mut handle = std::ptr::null_mut();
+            assert_eq!(XApuConnect(&input, &mut output, &mut handle), S_OK);
+            let base = output.memory.cast::<u8>();
+            // SAFETY: inside the connection memory.
+            unsafe { std::ptr::copy_nonoverlapping(packet.as_ptr(), base, n) };
+            let activate = |stream: u32, channels: u32| Activate {
+                id: id(ACTIVATE, stream),
+                channels,
+                init_length: 0,
+                init: std::ptr::null(),
+                start_pitch: 1.0,
+                processing_length: 0,
+                processing: std::ptr::null_mut(),
+            };
+            let process = |stream: u32, out: *mut u8, frame_count: u32| Process {
+                id: id(PROCESS, stream),
+                pitch_ramp: 0.0,
+                target_pitch: 1.0,
+                first_frame: 0,
+                frame_count,
+                input_length: n as u32,
+                input: base,
+                output_length: 0x4000,
+                output: out,
+            };
+            let enqueue = |command: *const CommandId| {
+                XApuEnqueueCommand(handle, command, std::ptr::null_mut())
+            };
+            let mut result = std::mem::MaybeUninit::<ApuResult>::zeroed();
+            // Dequeue until the result of `stream`'s `kind` command arrives.
+            let mut wait_for = |stream: u32, kind: u32| {
+                loop {
+                    assert_eq!(XApuDequeueResult(handle, result.as_mut_ptr()), S_OK);
+                    // SAFETY: written above.
+                    let r = unsafe { result.assume_init_read() };
+                    if (r.id.stream, r.id.kind) == (stream, kind) {
+                        return r;
+                    }
+                }
+            };
+            // SAFETY: the write above fits the connection memory.
+            for stream in 1..=3 {
+                let activate = activate(stream, 2);
+                assert_eq!(enqueue((&raw const activate).cast()), S_OK);
+            }
+            let aligned_out = base.wrapping_add(0x2000);
+            let aligned_command = process(1, aligned_out, 960);
+            assert_eq!(enqueue((&raw const aligned_command).cast()), S_OK);
+            // The odd offset makes `cast::<f32>()` UB, which previously
+            // aborted with `0xc0000409`.
+            let unaligned = base.wrapping_add(0x4001);
+            let misaligned_command = process(2, unaligned, 960);
+            assert_eq!(enqueue((&raw const misaligned_command).cast()), S_OK);
+            let silent = process(3, unaligned, 0);
+            assert_eq!(enqueue((&raw const silent).cast()), S_OK);
+            for (stream, channels) in [(4, 0), (5, 3), (6, u32::MAX)] {
+                let activate = activate(stream, channels);
+                assert_eq!(enqueue((&raw const activate).cast()), S_OK);
+            }
+
+            let aligned = wait_for(1, PROCESS);
+            assert_eq!((aligned.error, aligned.frames), (S_OK, 960));
+            let aligned_length = aligned.output_length;
+            assert_eq!(aligned_length, 960 * 2 * 4);
+            let misaligned = wait_for(2, PROCESS);
+            assert_eq!((misaligned.error, misaligned.frames), (S_OK, 960));
+            let zero = wait_for(3, PROCESS);
+            assert_eq!((zero.error, zero.frames, zero.output_length), (S_OK, 0, 0));
+            for stream in 4..=6 {
+                let error = wait_for(stream, ACTIVATE).error;
+                assert_eq!(error, E_INVALIDARG);
+            }
+            // SAFETY: both buffers hold the 960 stereo frames' bytes.
+            let (aligned, misaligned) = unsafe {
+                (
+                    std::slice::from_raw_parts(aligned_out, 960 * 2 * 4),
+                    std::slice::from_raw_parts(unaligned, 960 * 2 * 4),
+                )
+            };
+            assert_eq!(misaligned, aligned, "options {options}");
+            if let Some(inter) = &interleaved {
+                // Deinterleaved puts every left sample first, then every
+                // right one; derive that from the interleaved run's bytes.
+                for i in 0..960 {
+                    assert_eq!(
+                        &misaligned[i * 4..][..4],
+                        &inter[(i * 2) * 4..][..4],
+                        "left {i}"
+                    );
+                    assert_eq!(
+                        &misaligned[(960 + i) * 4..][..4],
+                        &inter[(i * 2 + 1) * 4..][..4],
+                        "right {i}"
+                    );
+                }
+            } else {
+                interleaved = Some(aligned.to_vec());
+            }
+            assert_eq!(XApuDisconnect(handle), S_OK);
+        }
     }
 }
