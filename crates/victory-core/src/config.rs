@@ -251,6 +251,7 @@ mod tests {
             data_dir: outside.path().join("data"),
             test_titles: vec![outside.path().join("other")],
             source: None,
+            fidelityfx_dir: None,
         };
         let violations = cfg.policy_violations();
         assert_eq!(violations.len(), 1);
@@ -266,6 +267,7 @@ mod tests {
             data_dir: outside.path().join("data"),
             test_titles: vec![outside.path().join("other")],
             source: None,
+            fidelityfx_dir: None,
         };
         assert!(cfg.policy_violations().is_empty());
     }
