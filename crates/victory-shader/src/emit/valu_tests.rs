@@ -520,7 +520,7 @@ fn v_log_f32_near_one_matches_the_reference() {
     // (input, the exact f64 log2 of it): log2(1-2^-24) is the FIND-5 case
     // where WARP lands about 20% off.
     let cases: &[(u32, f64)] = &[
-        (f(1.0 - 2.0f32.powi(-24)), -8.599_132_799_414_561_7e-08),
+        (f(1.0 - 2.0f32.powi(-24)), -8.599_132_799_414_562e-08),
         (f(0.5), -1.0),
         (f(2.0), 1.0),
         (f(1.0e10), f64::from(f32::log2(1.0e10))),
