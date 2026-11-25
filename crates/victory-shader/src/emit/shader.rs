@@ -137,8 +137,9 @@ pub(crate) struct Shader {
     lds: Option<V>,
     main: V,
     pub entry: usize,
-    /// View heap indices stay below this ([`super::view_heap_limit`]).
-    view_limit: Option<u32>,
+    /// View heap indices stay below this ([`super::view_heap_limit`]); a
+    /// sibling module's clamp reads it too (`lower`'s `buffer_guard`).
+    pub(super) view_limit: Option<u32>,
 }
 
 impl Shader {
