@@ -2379,6 +2379,15 @@ mod tests {
         // Boundaries: 59 belongs to the preceding family, 66 is unmapped.
         assert_eq!(family(59), 53);
         assert_eq!(family(66), 66);
+        // B8G8R8A8_UNORM (87) and B8G8R8X8_UNORM (88) fold into their
+        // families' typeless heads (90, 92), as their sRGB views (91, 93)
+        // do; a copy between any two of a family is legal.
+        assert_eq!(family(87), 90);
+        assert_eq!(family(88), 92);
+        assert_eq!(family(90), 90);
+        assert_eq!(family(91), 90);
+        assert_eq!(family(92), 92);
+        assert_eq!(family(93), 92);
     }
 
     type Release = extern "system" fn(This) -> u32;

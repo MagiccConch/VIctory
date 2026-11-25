@@ -642,6 +642,30 @@ extern "system" fn copy_buffer_region(
     let _ = (this, dst, dst_offset, src, src_offset, len);
 }
 
+/// Whether a copy between two host textures reaches the list: the runtime
+/// takes formats of one typeless family and refuses the list at its close
+/// (`0x80070057`), the title with it (twice, at the video's first copies).
+/// Not recorded then: the copy is skipped, each pair of formats named once.
+#[cfg(windows)]
+fn copyable(
+    to: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    from: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) -> bool {
+    // SAFETY: live resources.
+    let (a, b) = unsafe { (to.GetDesc(), from.GetDesc()) };
+    let (a, b) = (a.Format.0 as u32, b.Format.0 as u32);
+    if crate::resource::family(a) == crate::resource::family(b) {
+        return true;
+    }
+    static REFUSED: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&(a, b)) {
+        seen.push((a, b));
+        tracing::warn!(to = a, from = b, "a copy between different format families is not recorded");
+    }
+    false
+}
+
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
@@ -652,6 +676,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
+            if !copyable(&to, &from) {
+                return;
+            }
             if crate::texture::title_written(&from) {
                 crate::texture::upload(list, src, &from);
             }
@@ -747,6 +774,9 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            if !copyable(&to, &texture) {
+                return;
+            }
             if crate::texture::title_written(&texture) {
                 crate::texture::upload(list, src.resource, &texture);
             }
@@ -940,6 +970,9 @@ extern "system" fn resolve(
             crate::resource::host_resource(src),
         )
     {
+        if !copyable(&to, &from) {
+            return;
+        }
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_RESOLVE_MODE_AVERAGE, ID3D12GraphicsCommandList1,
