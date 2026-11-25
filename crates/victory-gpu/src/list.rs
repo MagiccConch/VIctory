@@ -713,6 +713,23 @@ extern "system" fn clear_rtv(
         let Some(color) = (unsafe { color.as_ref() }) else {
             return;
         };
+        // A texture whose format cannot serve render targets (`B4G4R4A4` on
+        // the host) is made without the flag: the clear is skipped.
+        // SAFETY: a live texture.
+        let desc = unsafe { texture.GetDesc() };
+        if desc.Flags.0
+            & windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0
+            == 0
+        {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    format = desc.Format.0,
+                    "a render target clear the host cannot do"
+                )
+            });
+            return;
+        }
         let rects = (count > 0 && !rects.is_null()).then(|| {
             // SAFETY: the title passes `count` rectangles, laid out as the host's.
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }

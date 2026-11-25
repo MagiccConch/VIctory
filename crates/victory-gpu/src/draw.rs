@@ -337,6 +337,18 @@ impl State {
             let Some(texture) = crate::resource::host_resource(record.resource) else {
                 continue;
             };
+            // A texture whose format cannot serve render targets (`B4G4R4A4`
+            // on the host) is made without the flag: drawing goes on without
+            // this target.
+            // SAFETY: a live texture.
+            let desc = unsafe { texture.GetDesc() };
+            if desc.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 == 0 {
+                once!(
+                    format = desc.Format.0,
+                    "a render target the host cannot render to"
+                );
+                continue;
+            }
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);

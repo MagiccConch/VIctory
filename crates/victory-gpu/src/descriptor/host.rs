@@ -1157,29 +1157,7 @@ fn default_view(resource: crate::object::This) -> bool {
 
 /// Whether the host stores to typed unordered views of `format`.
 fn typed_store(format: u32) -> bool {
-    static KNOWN: Mutex<Vec<(u32, bool)>> = Mutex::new(Vec::new());
-    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(&(_, ok)) = known.iter().find(|(f, _)| *f == format) {
-        return ok;
-    }
-    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
-        Format: DXGI_FORMAT(format as i32),
-        ..Default::default()
-    };
-    let ok = host().is_some_and(|h| {
-        // SAFETY: a plain query into a struct of its size.
-        unsafe {
-            h.device.CheckFeatureSupport(
-                D3D12_FEATURE_FORMAT_SUPPORT,
-                (&raw mut support).cast(),
-                size_of_val(&support) as u32,
-            )
-        }
-        .is_ok()
-            && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
-    });
-    known.push((format, ok));
-    ok
+    crate::resource::supported_flags(format) & crate::resource::UNORDERED != 0
 }
 
 /// Makes the host descriptor for `view` at `at` (in any host view heap):

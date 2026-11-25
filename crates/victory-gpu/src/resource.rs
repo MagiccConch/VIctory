@@ -1023,15 +1023,80 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
+    // The host refuses a resource whose flags its format cannot serve
+    // (`0x80070057`): a render target of `B4G4R4A4_UNORM` left the memory
+    // without a host texture at all. A typeless format serves what its
+    // family does. Without the unsupported flags the texture is made; its
+    // render targets and unordered views are then skipped (`set_targets`,
+    // `clear_rtv`, and the views the host refuses).
+    if !typeless(d.format) {
+        d.flags &= !USES | supported_flags(d.format);
+    }
+    // The host takes either render target or depth flags, never both.
+    if d.flags & DEPTH != 0 {
+        d.flags &= !RENDER_TARGET;
+    }
     Some(d)
 }
 
+const RENDER_TARGET: u32 = 1;
 const DEPTH: u32 = 2;
 #[cfg(windows)]
-const UNORDERED: u32 = 4;
+pub(crate) const UNORDERED: u32 = 4;
 /// Render target, depth, unordered access: what a host texture allows.
 #[cfg(windows)]
 const USES: u32 = 0x7;
+
+/// Whether a format is a family's typeless one (the family's head, the
+/// next format's family again): the same test [`crate::descriptor::host`]
+/// applies to view formats.
+pub(crate) fn typeless(format: u32) -> bool {
+    family(format) == format && family(format + 1) == format
+}
+
+/// The bits of a texture's flags ([`USES`]: render target, unordered
+/// access) the host's format support takes for `format` (depth formats
+/// are standard and not asked). A texture whose format cannot serve the
+/// uses it asks for is still made, without the unsupported flags: none at
+/// all leaves the memory without a host texture, and everything it does
+/// on the host is skipped (`0x80070057`, a 2560×1440 `B4G4R4A4_UNORM`
+/// render target at world entry, and the device removal that follows).
+#[cfg(windows)]
+pub(crate) fn supported_flags(format: u32) -> u32 {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT, D3D12_FEATURE_FORMAT_SUPPORT,
+        D3D12_FORMAT_SUPPORT1_RENDER_TARGET, D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    static KNOWN: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, bits)) = known.iter().find(|&(f, _)| *f == format) {
+        return bits;
+    }
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    let mut bits = 0;
+    if let Some(h) = crate::host::host() {
+        // SAFETY: a plain query into a struct of its size.
+        let ok = unsafe {
+            h.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        }
+        .is_ok();
+        if ok {
+            let s = support.Support1.0;
+            bits = u32::from(s & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 != 0)
+                | u32::from(s & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0) << 2;
+        }
+    }
+    known.push((format, bits));
+    bits
+}
 
 /// What a texture memory is, for the one host texture it gets: its address
 /// and shape (the console's layout resolved, mips counted, and the bytes
@@ -1175,8 +1240,9 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     use windows::core::Interface;
     let host = crate::host::host()?;
     // The clear value names the format too: format, then color or depth
-    // and stencil (5 words).
-    let clear_value = (!clear.is_null()).then(|| {
+    // and stencil (5 words). The host takes one only for a texture that
+    // still serves render targets or depth: a flagless one it refuses.
+    let clear_value = (d.flags & (RENDER_TARGET | DEPTH) != 0 && !clear.is_null()).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = pc_format(value[0]);
