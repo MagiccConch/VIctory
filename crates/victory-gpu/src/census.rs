@@ -71,12 +71,21 @@ pub(crate) fn skip_wc_back() -> bool {
 /// (it implies [`skip_wc_back`]): the card does not hash or compare the
 /// declared writes of copies of write-combining title memory at all, since
 /// nothing of them is fetched back. The CPU's changes are still sent up.
+///
+/// UNSAFE, do not use for play: one tester's RTX 5080 lost its device about
+/// 75 s into the world with it (on `f85101b` with `VICTORY_ASYNC_SUBMIT=1
+/// VICTORY_QUEUE2=1`); other runs, on a 5080 and a 3080 Ti, had none, and
+/// the cause is not known. `VICTORY_SKIP_WC_BACK=1` alone has had no device
+/// loss in any reported run.
 pub(crate) fn skip_wc_compare() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         let on = std::env::var_os("VICTORY_SKIP_WC_COMPARE").is_some_and(|v| v == "1");
         if on {
-            tracing::warn!("VICTORY_SKIP_WC_COMPARE=1: copies of write-combining title memory are not hashed or compared on the card (experiment)");
+            tracing::warn!(
+                "VICTORY_SKIP_WC_COMPARE=1: copies of write-combining title memory are not hashed or compared on the card \
+                 (UNSAFE experiment: a device removal was reported with it; use VICTORY_SKIP_WC_BACK=1 alone)"
+            );
         }
         on
     })
