@@ -3490,13 +3490,15 @@ fn present_barriers(
     let mut last = Vec::new();
     if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
         first.push(transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE));
-        last.push(transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state));
     }
     first.push(transition(
         back,
         D3D12_RESOURCE_STATE_PRESENT,
         D3D12_RESOURCE_STATE_COPY_DEST,
     ));
+    if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+        last.push(transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state));
+    }
     last.push(transition(
         back,
         D3D12_RESOURCE_STATE_COPY_DEST,
@@ -3690,10 +3692,11 @@ mod present_barriers {
 
     /// A resource that is only an address: `as_raw` never runs code on it,
     /// and `ManuallyDrop` keeps the wrapper from releasing it (there was
-    /// no reference).
+    /// no reference). The address comes from the heap, so two calls never
+    /// share one, and a leaked byte stands in for the resource.
     fn fake() -> (ManuallyDrop<ID3D12Resource>, usize) {
-        let marker = 0u8;
-        let at = std::ptr::from_ref(&marker) as usize;
+        let marker = Box::leak(Box::new(0u8));
+        let at = std::ptr::from_ref(marker) as usize;
         // SAFETY: `ID3D12Resource` is pointer-sized; the wrapper only
         // carries the address (never dereferenced, no release).
         let resource = unsafe { std::mem::transmute_copy::<usize, ID3D12Resource>(&at) };
