@@ -186,7 +186,21 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            let adapter = by_preference();
+            if let Err(why) = &adapter {
+                tracing::warn!("no adapter by preference: {why}");
+            }
+            match adapter.ok().flatten() {
+                Some(adapter) => {
+                    let desc = adapter.GetDesc1()?;
+                    tracing::info!(
+                        "host device on {} (the adapter by preference)",
+                        String::from_utf16_lossy(&desc.Description)
+                    );
+                    D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+                }
+                None => D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?,
+            }
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         let messages = debug
@@ -254,6 +268,45 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
         })
+    }
+}
+
+/// The adapter the host device lands on: the one with the highest
+/// performance (the discrete card on hybrid systems), or the one
+/// `VICTORY_ADAPTER` names by a substring of its description. Without a
+/// choice, DXGI's primary adapter takes the device — which on hybrid
+/// systems is the integrated one, whose driver lacks the tiers the
+/// console's pipelines need (mesh shaders, 64-bit atomics).
+fn by_preference() -> windows::core::Result<Option<IDXGIAdapter1>> {
+    // SAFETY: plain DXGI adapter enumeration and queries.
+    unsafe {
+        let wanted = std::env::var_os("VICTORY_ADAPTER")
+            .map(|v| v.to_string_lossy().into_owned().to_lowercase());
+        let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+        if let Some(wanted) = &wanted {
+            let mut at = 0u32;
+            while let Ok(adapter) = factory.EnumAdapters1(at) {
+                at += 1;
+                let desc = adapter.GetDesc1()?;
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                    continue;
+                }
+                if String::from_utf16_lossy(&desc.Description)
+                    .to_lowercase()
+                    .contains(wanted)
+                {
+                    return Ok(Some(adapter));
+                }
+            }
+            return Err(windows::core::Error::empty());
+        }
+        let adapter = factory
+            .EnumAdapterByGpuPreference::<IDXGIAdapter1>(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)?;
+        let desc = adapter.GetDesc1()?;
+        if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+            return Err(windows::core::Error::empty());
+        }
+        Ok(Some(adapter))
     }
 }
 

@@ -16,6 +16,17 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 
+// The D3D12 Agility SDK: the runtime this points at (D3D12Core.dll beside
+// the exe) accepts the root signature flags the console's bindless heaps
+// need, which the Windows 10 runtime that ships in the box refuses
+// (upstream issue 753).
+#[cfg(windows)]
+#[unsafe(no_mangle)]
+pub static D3D12SDKVersion: u32 = 620;
+#[cfg(windows)]
+#[unsafe(no_mangle)]
+pub static D3D12SDKPath: &[u8; 9] = b".\\D3D12\\\0";
+
 #[derive(Parser)]
 #[command(
     name = "victory",
