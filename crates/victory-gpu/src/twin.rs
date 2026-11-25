@@ -394,7 +394,9 @@ pub(crate) fn route(list: &HostList, depth: &Arc<HostTexture>, twin: &Twin, want
     }
     // The planes take the state the views bound on them need: unordered
     // access for the unordered views, render target for the render
-    // targets (both when both are bound — a legal state).
+    // targets. Both at once is no state on the host (the console has
+    // one): `crate::host::legal_for` keeps the unordered side, and the
+    // render targets re-bind before their draws.
     let mut state = 0;
     if wanted & UNORDERED_ACCESS != 0 {
         state |= UNORDERED_ACCESS;

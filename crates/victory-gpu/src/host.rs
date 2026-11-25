@@ -3200,6 +3200,14 @@ pub(crate) fn legal_state(texture: &ID3D12Resource, state: u32) -> u32 {
     legal_for(unsafe { texture.GetDesc() }.Flags.0 as u32, state)
 }
 
+/// A `once` warning for this file.
+macro_rules! once {
+    ($($arg:tt)*) => {{
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!($($arg)*));
+    }};
+}
+
 /// [`legal_state`] for a texture with resource flags `flags`.
 pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
     // (flag, set or clear forbids, state bits): render target, unordered
@@ -3210,10 +3218,25 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
         (0x2, false, 0x10 | 0x20),
         (0x8, true, 0x40 | 0x80),
     ];
-    FORBIDDEN
+    let legal = FORBIDDEN
         .iter()
         .filter(|&&(flag, deny, _)| (flags & flag != 0) == deny)
-        .fold(state, |s, &(_, _, bits)| s & !bits)
+        .fold(state, |s, &(_, _, bits)| s & !bits);
+    unordered_access_only(legal)
+}
+
+/// A state with render target and unordered access together: the console
+/// serves both views from one state, the host has no such state and
+/// refuses the barrier when the list closes. The unordered side is kept;
+/// render targets re-bind before their draws (`set_targets`), moving the
+/// state back first.
+pub(crate) fn unordered_access_only(state: u32) -> u32 {
+    if state & (0x4 | 0x8) == 0x4 | 0x8 {
+        once!("a texture in a render target and unordered access state at once: the unordered side is kept");
+        state & !0x4
+    } else {
+        state
+    }
 }
 
 impl Host {
@@ -3678,6 +3701,24 @@ mod withholding {
             drop(copy);
             crate::watch::tests::free(p);
         }
+    }
+}
+
+#[cfg(test)]
+mod legal_states {
+    /// The console serves render target and unordered access from one
+    /// state; the host has none and refuses the barrier when the list
+    /// closes. The unordered side stays, whatever the flags allow.
+    #[test]
+    fn a_render_target_and_unordered_access_state_keeps_only_the_unordered_side() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        };
+        let flags =
+            (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS).0 as u32;
+        assert_eq!(super::legal_for(flags, 0x4 | 0x8), 0x8);
+        assert_eq!(super::legal_for(flags, 0x8), 0x8);
+        assert_eq!(super::legal_for(flags, 0x4), 0x4);
     }
 }
 
