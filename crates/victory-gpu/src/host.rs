@@ -3248,10 +3248,72 @@ pub(crate) fn unordered_access_only(state: u32) -> u32 {
     }
     if state & (0x4 | 0x8) == 0x4 | 0x8 {
         once!("a texture in a render target and unordered access state at once: the unordered side is kept");
-        state & !0x4
-    } else {
-        state
+        return state & !0x4;
     }
+    if state & 0x4 != 0 && state != 0x4 {
+        once!("a render target with other state bits: the render target side is kept");
+        return 0x4;
+    }
+    state
+}
+
+/// The state bits of a buffer only (vertex and constant, index, stream
+/// out, indirect argument): the console takes them for textures too, where
+/// the host refuses them (`texture_state` drops them at the console's own
+/// barriers; these arrive by other paths).
+pub(crate) const BUFFER_ONLY: u32 = 0x1 | 0x2 | 0x100 | 0x200;
+
+/// The pair of states a barrier records for `resource`: both made
+/// host-legal before the list takes them (a render target or a depth write
+/// alone, buffer states off a texture, the flag-forbidden bits gone). A
+/// state that changed is warned about once, with the state it became.
+/// Every barrier goes through [`transition`], ours and the title's, so a
+/// list that closes is one the debug layer has accepted.
+fn legal_pair(resource: &ID3D12Resource, before: u32, after: u32) -> (u32, u32) {
+    // Exclusivity is a value problem: a state with a render target or a
+    // depth write among other bits is refused whatever the resource is.
+    // Buffer states on a texture need the resource's kind for.
+    let exclusive = |state: u32| (state & 0x10 != 0 && state != 0x10) || (state & 0x4 != 0 && state != 0x4);
+    if !exclusive(before) && !exclusive(after) && (before | after) & BUFFER_ONLY == 0 {
+        return (before, after);
+    }
+    // SAFETY: a plain query.
+    let (buffer, flags) = unsafe {
+        let desc = resource.GetDesc();
+        (
+            desc.Dimension == windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DIMENSION_BUFFER,
+            desc.Flags.0 as u32,
+        )
+    };
+    let (fixed_before, changed) = fixed_state(buffer, flags, before);
+    if changed {
+        once!("{}", the_pair(buffer, before, fixed_before));
+    }
+    let (fixed_after, changed) = fixed_state(buffer, flags, after);
+    if changed {
+        once!("{}", the_pair(buffer, after, fixed_after));
+    }
+    (fixed_before, fixed_after)
+}
+
+/// `state` made host-legal for a buffer or a texture of `flags`: the
+/// changed one and whether it changed.
+fn fixed_state(buffer: bool, flags: u32, state: u32) -> (u32, bool) {
+    let fixed = if buffer {
+        // Buffers cannot be render targets or depth targets.
+        state & !(0x4 | 0x10 | 0x20)
+    } else {
+        legal_for(flags, state & !BUFFER_ONLY)
+    };
+    (fixed, fixed != state)
+}
+
+/// The warning for a state made host-legal: what it was, what it became.
+fn the_pair(buffer: bool, state: u32, fixed: u32) -> String {
+    format!(
+        "a barrier takes {} state {state:#x} as {fixed:#x} on the host",
+        if buffer { "a buffer" } else { "a texture" },
+    )
 }
 
 impl Host {
@@ -3497,6 +3559,13 @@ pub(crate) fn transition(
     before: D3D12_RESOURCE_STATES,
     after: D3D12_RESOURCE_STATES,
 ) -> D3D12_RESOURCE_BARRIER {
+    // Every barrier goes through here, ours and the title's: state
+    // combinations the host refuses (a render target or a depth write with
+    // other bits, buffer states on a texture) are made host-legal before
+    // the list records them, so a list that closes is one the layer has
+    // already accepted.
+    let (before, after) = legal_pair(resource, before.0 as u32, after.0 as u32);
+    let (before, after) = (D3D12_RESOURCE_STATES(before as i32), D3D12_RESOURCE_STATES(after as i32));
     #[cfg(test)]
     tests::ISSUED.with(|l| l.borrow_mut().push((resource.as_raw() as usize, before.0 as u32, after.0 as u32)));
     #[cfg(feature = "diagnostics")]
@@ -3808,6 +3877,56 @@ mod legal_states {
         assert_eq!(super::unordered_access_only(0x10), 0x10);
         assert_eq!(super::unordered_access_only(0x20 | 0x8), 0x20 | 0x8);
     }
+
+    /// A render target with other bits at once keeps its other side when
+    /// there is unordered access (whose writes the console reads as its
+    /// targets), the render target alone otherwise.
+    #[test]
+    fn a_render_target_with_other_state_bits() {
+        assert_eq!(super::unordered_access_only(0x4 | 0x400), 0x400);
+        assert_eq!(super::unordered_access_only(0x4 | 0x1), 0x4);
+        assert_eq!(super::unordered_access_only(0x4), 0x4);
+    }
+
+    /// The pair fix for buffers: no render target or depth states. For
+    /// textures: the buffer states gone, the flag-forbidden ones gone,
+    /// exclusivity held. Legal states pass unchanged.
+    #[test]
+    fn a_fixed_state_is_host_legal() {
+        // a buffer: depth write and render target gone, its own kept
+        assert_eq!(super::fixed_state(true, 0, 0x10 | 0x8), (0x8, true));
+        assert_eq!(super::fixed_state(true, 0, 0x4 | 0x1), (0x1, true));
+        assert_eq!(super::fixed_state(true, 0, 0x20 | 0x40), (0x40, true));
+        assert_eq!(super::fixed_state(true, 0, 0x1 | 0x8), (0x1 | 0x8, false));
+        // a texture of every flag: the buffer states gone
+        let flags = super::flag_all();
+        assert_eq!(super::fixed_state(false, flags, 0x200 | 0x4), (0x4, true));
+        assert_eq!(super::fixed_state(false, flags, 0x100 | 0x40), (0x40, true));
+        // depth write exclusivity and render target exclusivity held
+        assert_eq!(super::fixed_state(false, flags, 0x10 | 0x8), (0x10, true));
+        assert_eq!(super::fixed_state(false, flags, 0x4 | 0x400), (0x400, true));
+        // legal multi-bit states pass unchanged
+        assert_eq!(super::fixed_state(false, flags, 0x840), (0x840, false));
+        assert_eq!(super::fixed_state(false, flags, 0xE0), (0xE0, false));
+        assert_eq!(super::fixed_state(false, flags, 0x2A8), (0x2A8, false));
+    }
+}
+
+/// A texture's flags, all of them set: render target, unordered access,
+/// depth stencil and shader resource.
+#[cfg(test)]
+fn flag_all() -> u32 {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE,
+    };
+    (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
+        | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+        | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL
+        | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS
+        | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)
+        .0 as u32
 }
 
 #[cfg(test)]
