@@ -141,10 +141,12 @@ pub(crate) fn packed(console: u32) -> bool {
     PACKED.contains(&console)
 }
 
-/// The pipeline's render target format for a host one: the packed colours
-/// render their twin's `R8G8B8A8`.
+/// The pipeline's render target format for a host one: a packed colour
+/// the host cannot render to (`B4G4R4A4` here) renders its twin's
+/// `R8G8B8A8`; one it renders itself keeps its format, matching the view
+/// bound on the texture.
 pub(crate) fn render_format(format: u32) -> u32 {
-    if PACKED.contains(&format) {
+    if PACKED.contains(&format) && crate::resource::supported_flags(format) & crate::resource::RENDER_TARGET == 0 {
         R8G8B8A8
     } else {
         format
@@ -366,9 +368,21 @@ fn integer(format: u32) -> bool {
 /// unordered access the twin's planes are moved there and true returned:
 /// the depth texture itself is not used.
 pub(crate) fn route(list: &HostList, depth: &Arc<HostTexture>, twin: &Twin, wanted: u32) -> bool {
-    // A packed colour's render targets write its twin as well: the host
-    // renders nothing into the packed texture itself.
-    let side = if wanted & (UNORDERED_ACCESS | RENDER_TARGET) != 0 { TWIN } else { DEPTH };
+    // A packed colour's render targets write its twin — unless the host
+    // renders that format itself (its texture keeps the render target
+    // flag): then the render target is the texture, and only the
+    // unordered views are the twin's.
+    // SAFETY: a live resource.
+    let renders = unsafe { depth.texture.GetDesc() }.Flags.0
+        & windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0
+        != 0;
+    let side = if wanted & UNORDERED_ACCESS != 0
+        || (twin.mode != 0 && wanted & RENDER_TARGET != 0 && !renders)
+    {
+        TWIN
+    } else {
+        DEPTH
+    };
     let writes = side == TWIN || wanted & (DEPTH_WRITE | RENDER_TARGET | COPY_DEST | RESOLVE_DEST) != 0;
     if let Some(to_depth) = list.twin_use(depth, side, writes)
         && twin.copy(&list.list, depth, to_depth, &mut |t, w| list.move_texture(t, w))
@@ -378,7 +392,18 @@ pub(crate) fn route(list: &HostList, depth: &Arc<HostTexture>, twin: &Twin, want
     if side == DEPTH {
         return false;
     }
-    let barriers: Vec<_> = twin.planes.iter().filter_map(|p| list.move_texture(p, UNORDERED_ACCESS)).collect();
+    // The planes take the state the views bound on them need: unordered
+    // access for the unordered views, render target for the render
+    // targets (both when both are bound — a legal state).
+    let mut state = 0;
+    if wanted & UNORDERED_ACCESS != 0 {
+        state |= UNORDERED_ACCESS;
+    }
+    if wanted & RENDER_TARGET != 0 && !renders {
+        state |= RENDER_TARGET;
+    }
+    let state = if state == 0 { UNORDERED_ACCESS } else { state };
+    let barriers: Vec<_> = twin.planes.iter().filter_map(|p| list.move_texture(p, state)).collect();
     if !barriers.is_empty() {
         // SAFETY: an open list and live textures.
         unsafe { list.list.ResourceBarrier(&barriers) };

@@ -1039,7 +1039,8 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     Some(d)
 }
 
-const RENDER_TARGET: u32 = 1;
+#[cfg(windows)]
+pub(crate) const RENDER_TARGET: u32 = 1;
 const DEPTH: u32 = 2;
 #[cfg(windows)]
 pub(crate) const UNORDERED: u32 = 4;
