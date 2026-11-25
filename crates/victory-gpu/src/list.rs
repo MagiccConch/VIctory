@@ -714,34 +714,48 @@ extern "system" fn clear_rtv(
             return;
         };
         // A texture whose format cannot serve render targets (`B4G4R4A4` on
-        // the host) is made without the flag: the clear is skipped.
+        // the host) is made without the flag: a packed colour clears its
+        // writable twin, others skip the clear.
         // SAFETY: a live texture.
         let desc = unsafe { texture.GetDesc() };
-        if desc.Flags.0
+        let (texture, view) = if desc.Flags.0
             & windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0
             == 0
         {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| {
-                tracing::warn!(
-                    format = desc.Format.0,
-                    "a render target clear the host cannot do"
-                )
-            });
-            return;
-        }
+            let Some(plane) = crate::resource::host_copy(record.resource)
+                .and_then(|copy| crate::twin::rtv(record.resource, &copy))
+            else {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(
+                        format = desc.Format.0,
+                        "a render target clear the host cannot do"
+                    )
+                });
+                return;
+            };
+            let mut view = record.desc();
+            if let Some(view) = view.as_mut() {
+                view.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(
+                    crate::twin::render_format(view.Format.0 as u32) as i32,
+                );
+            }
+            (plane.texture.clone(), view)
+        } else {
+            (texture.clone(), record.desc())
+        };
         let rects = (count > 0 && !rects.is_null()).then(|| {
             // SAFETY: the title passes `count` rectangles, laid out as the host's.
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const RENDER_TARGET: u32 = 0x4;
-        let rtv = host.rtv(texture, record.desc().as_ref());
+        let rtv = host.rtv(&texture, view.as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
                 use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
                 list.list.ResourceBarrier(&[crate::host::transition(
-                    texture,
+                    &texture,
                     State(before as i32),
                     State(RENDER_TARGET as i32),
                 )]);

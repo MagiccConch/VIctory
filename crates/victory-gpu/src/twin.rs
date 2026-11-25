@@ -13,6 +13,14 @@
 //! value written as 16-bit depth compares equal to the same depth
 //! rasterised.
 //!
+//! The packed 16-bit colour formats work the same way: the console
+//! renders to and computes into `B4G4R4A4`, `B5G5R5A1` and `B5G6R5` (the
+//! title's screens and their overlays); the host takes neither a render
+//! target nor an unordered view in them. Their twin is one `R8G8B8A8`
+//! plane: the translated shaders store and output plain float colours,
+//! which the host encodes there, and the copies convert the 8-bit
+//! channels to the console's packed bits and back.
+//!
 //! shortcut: uses the lists do not name (shaders indexing the heap
 //! themselves) move nothing; a whole twin is copied for any use of either
 //! plane, also when the next pass overwrites all of it; console 24-bit
@@ -54,6 +62,9 @@ pub(crate) struct Twin {
     pub(crate) planes: Vec<Arc<HostTexture>>,
     /// Which side is newer as of the lists submitted so far.
     pub(crate) newer: AtomicU8,
+    /// What the planes hold: 0 the depth formats, else a mode of the
+    /// converter (`SOURCE`), one per packed colour format.
+    mode: u32,
     /// Per plane and subresource: how its bytes go through `scratch`.
     routes: Vec<Route>,
     /// A shader-writable buffer the copies go through, in the common state
@@ -104,11 +115,48 @@ fn plane_formats(console: u32) -> Option<&'static [u32]> {
     }
 }
 
+/// The console's packed 16-bit colour formats, which the host takes
+/// neither a render target nor an unordered view in: `B5G6R5`, `B5G5R5A1`,
+/// `B4G4R4A4`. Their twins hold `R8G8B8A8`; the converter's modes 1 to 3
+/// match this order.
+pub(crate) const PACKED: [u32; 3] = [85, 86, 115];
+
+/// The packed colours' twin plane: the stores and outputs of the
+/// translated shaders are plain float colours.
+const R8G8B8A8: u32 = 28;
+
+/// The twin's plane formats for a console format: a depth format's planes,
+/// or one `R8G8B8A8` for the packed colours.
+fn plane_formats_or_packed(console: u32) -> Option<&'static [u32]> {
+    match plane_formats(console) {
+        Some(f) => Some(f),
+        None if PACKED.contains(&console) => Some(&[R8G8B8A8]),
+        None => None,
+    }
+}
+
+/// Whether the console format's render targets and unordered views are
+/// made on a writable twin (`PACKED`).
+pub(crate) fn packed(console: u32) -> bool {
+    PACKED.contains(&console)
+}
+
+/// The pipeline's render target format for a host one: the packed colours
+/// render their twin's `R8G8B8A8`.
+pub(crate) fn render_format(format: u32) -> u32 {
+    if PACKED.contains(&format) {
+        R8G8B8A8
+    } else {
+        format
+    }
+}
+
 /// The twin of the depth texture `depth`, whose title resource has format
 /// `console`; `None` if the host makes none.
 fn make(console: u32, depth: &ID3D12Resource) -> Option<Twin> {
     let host = host()?;
-    let Some(formats) = plane_formats(console) else {
+    let packed = packed(console);
+    let Some(formats) = plane_formats_or_packed(console) else {
         once(console, 0, 0, "a depth texture of this format gets no writable twin: its unordered writes are dropped");
         return None;
     };
@@ -123,7 +171,11 @@ fn make(console: u32, depth: &ID3D12Resource) -> Option<Twin> {
     for &f in formats {
         let desc = D3D12_RESOURCE_DESC {
             Format: DXGI_FORMAT(f as i32),
-            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            Flags: if packed {
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
+            } else {
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+            },
             Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
             Alignment: 0,
             ..dd
@@ -134,11 +186,11 @@ fn make(console: u32, depth: &ID3D12Resource) -> Option<Twin> {
             host.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut texture)
         };
         if let Err(e) = made {
-            tracing::warn!(error = %e, ?desc, "no writable twin for a depth texture");
+            tracing::warn!(error = %e, ?desc, "no writable twin for a texture");
             return None;
         }
         let texture = texture?;
-        crate::host::name(&texture, || format!("depth twin {}x{} f{f}", dd.Width, dd.Height));
+        crate::host::name(&texture, || format!("{} twin {}x{} f{f}", if packed { "colour" } else { "depth" }, dd.Width, dd.Height));
         planes.push(Arc::new(HostTexture::new(texture, 0, Vec::new())));
     }
     // The depth texture's footprints, every plane, and the twin's.
@@ -173,17 +225,26 @@ fn make(console: u32, depth: &ID3D12Resource) -> Option<Twin> {
                 let twin = place(tf[s as usize], trows[s as usize]);
                 Route { plane: p, twin_sub: s, depth_sub: d as u32, twin, depth: Some(place(df[d], drows[d])) }
             };
-            if route.depth.is_some() && (td.Format != DXGI_FORMAT_R16_TYPELESS || df[d].Footprint.Format != DXGI_FORMAT_R32_TYPELESS) {
-                once(console, td.Format.0 as u32, df[d].Footprint.Format.0 as u32, "a depth twin plane with no conversion to the host's: not made");
-                return None;
+            if route.depth.is_some() {
+                // 16-bit depth through the host's 24-bit plane, or a packed
+                // colour through its `R8G8B8A8` one: the converter's cases.
+                let depth_case = !packed
+                    && td.Format == DXGI_FORMAT_R16_TYPELESS
+                    && df[d].Footprint.Format == DXGI_FORMAT_R32_TYPELESS;
+                let colour_case = packed && td.Format == DXGI_FORMAT(R8G8B8A8 as i32);
+                if !depth_case && !colour_case {
+                    once(console, td.Format.0 as u32, df[d].Footprint.Format.0 as u32, "a twin plane with no conversion to the host's: not made");
+                    return None;
+                }
             }
             routes.push(route);
         }
     }
     let scratch = scratch_buffer(at)?;
-    crate::host::name(&scratch, || format!("depth twin copies {at:#x}"));
-    tracing::debug!(console, width = dd.Width, height = dd.Height, planes = planes.len(), "a writable twin for a depth texture");
-    Some(Twin { planes, newer: AtomicU8::new(DEPTH), routes, scratch })
+    crate::host::name(&scratch, || format!("twin copies {at:#x}"));
+    let mode = if packed { 1 + PACKED.iter().position(|&f| f == console).unwrap() as u32 } else { 0 };
+    tracing::debug!(console, width = dd.Width, height = dd.Height, planes = planes.len(), mode, "a writable twin");
+    Some(Twin { planes, newer: AtomicU8::new(DEPTH), mode, routes, scratch })
 }
 
 /// A default-heap buffer of `size` bytes shaders may write, in the common
@@ -261,6 +322,8 @@ pub(crate) fn uav(
     let view = crate::resource::pc_format(words[0]);
     let format = if crate::resource::family(view) == own {
         view
+    } else if packed(console) {
+        R8G8B8A8
     } else {
         // R16_TYPELESS: unorm or uint; R32_TYPELESS: float or uint; R8: uint.
         match (own, integer(view)) {
@@ -271,7 +334,7 @@ pub(crate) fn uav(
             _ => 62,
         }
     };
-    once(console, words[0], plane as u32, "an unordered view of a depth texture, made on its writable twin");
+    once(console, words[0], plane as u32, "an unordered view of a texture the host cannot write, made on its writable twin");
     words[0] = format;
     words[plane_word] = 0;
     // SAFETY: 40 bytes in the host's layout.
@@ -279,6 +342,17 @@ pub(crate) fn uav(
     // SAFETY: a live texture and a slot of our heap.
     unsafe { host()?.device.CreateUnorderedAccessView(&texture.texture, None, Some(&desc), at) };
     Some(texture.texture.clone())
+}
+
+/// The texture of a render target view of `resource`, whose host copy
+/// `copy` is a texture the host cannot render to (a packed colour): its
+/// twin's plane, which the caller makes the view of, in `R8G8B8A8`.
+pub(crate) fn rtv(resource: This, copy: &Arc<HostTexture>) -> Option<Arc<HostTexture>> {
+    let console = crate::resource::title_format(resource)?;
+    let twin = copy.twin.get_or_init(|| make(console, &copy.texture)).as_ref()?;
+    let plane = twin.planes.first()?.clone();
+    once(console, 0, 0, "a render target of a packed colour texture, made on its writable twin");
+    Some(plane)
 }
 
 /// Whether a format holds integers (`_UINT`, `_SINT`).
@@ -292,7 +366,9 @@ fn integer(format: u32) -> bool {
 /// unordered access the twin's planes are moved there and true returned:
 /// the depth texture itself is not used.
 pub(crate) fn route(list: &HostList, depth: &Arc<HostTexture>, twin: &Twin, wanted: u32) -> bool {
-    let side = if wanted & UNORDERED_ACCESS != 0 { TWIN } else { DEPTH };
+    // A packed colour's render targets write its twin as well: the host
+    // renders nothing into the packed texture itself.
+    let side = if wanted & (UNORDERED_ACCESS | RENDER_TARGET) != 0 { TWIN } else { DEPTH };
     let writes = side == TWIN || wanted & (DEPTH_WRITE | RENDER_TARGET | COPY_DEST | RESOLVE_DEST) != 0;
     if let Some(to_depth) = list.twin_use(depth, side, writes)
         && twin.copy(&list.list, depth, to_depth, &mut |t, w| list.move_texture(t, w))
@@ -419,9 +495,18 @@ impl Twin {
                 for r in &self.routes {
                     let Some(d) = r.depth else { continue };
                     let (t, d) = (r.twin.Footprint, d);
-                    let constants = [t.Width, t.Height, t.RowPitch, r.twin.Offset as u32, d.Footprint.RowPitch, d.Offset as u32, u32::from(to_depth), 0];
+                    // A depth twin: the twin is the 16-bit side. A colour
+                    // twin: the console texture is the 16-bit side, the
+                    // twin's `R8G8B8A8` the 32-bit one.
+                    let (pitch16, at16, pitch32, at32) = if self.mode == 0 {
+                        (t.RowPitch, r.twin.Offset as u32, d.Footprint.RowPitch, d.Offset as u32)
+                    } else {
+                        (d.Footprint.RowPitch, d.Offset as u32, t.RowPitch, r.twin.Offset as u32)
+                    };
+                    let constants = [t.Width, t.Height, pitch16, at16, pitch32, at32, u32::from(to_depth), self.mode];
+                    let texels = if self.mode == 0 { t.Width.div_ceil(2) } else { t.Width };
                     l.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
-                    l.Dispatch(t.Width.div_ceil(2).div_ceil(64), t.Height, 1);
+                    l.Dispatch(texels.div_ceil(64), t.Height, 1);
                 }
                 l.ResourceBarrier(&[uav_barrier(), state(UNORDERED_ACCESS as i32, COPY_SOURCE as i32)]);
                 converted = true;
@@ -456,10 +541,13 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 /// 16-bit depth (unorm, two per dword) to the host's 24-bit depth plane (in
 /// the low 24 bits of 32) and back, in the scratch buffer: `u * (2^24 - 1)
 /// / 65535` rounded, exactly, and back to the 16-bit value whose 24-bit one
-/// is nearest.
+/// is nearest. Modes 1 to 3 convert a packed 16-bit colour (`B5G6R5`,
+/// `B5G5R5A1`, `B4G4R4A4`: blue, green, red, then alpha from the low bits)
+/// to the 8-bit channels of its twin's `R8G8B8A8` (red in the low byte) and
+/// back, each side rounded the way its hardware would.
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=8, b0), UAV(u0)"
-cbuffer C : register(b0) { uint width; uint height; uint pitch16; uint at16; uint pitch32; uint at32; uint toDepth; uint unused; };
+cbuffer C : register(b0) { uint width; uint height; uint pitch16; uint at16; uint pitch32; uint at32; uint toDepth; uint mode; };
 RWByteAddressBuffer buf : register(u0);
 uint d24(uint u) { return u * 256 + (u * 255 + 32767) / 65535; }
 uint u16(uint d) {
@@ -471,23 +559,51 @@ uint u16(uint d) {
     if (u < 65535 && abs((int)d24(u + 1) - (int)d) < err) { best = u + 1; }
     return best;
 }
+uint up(uint v, uint m) { return (v * 255 + m / 2) / m; }
+uint down(uint v, uint m) { return (v * m + 127) / 255; }
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
-    uint x = id.x * 2;
     uint y = id.y;
-    if (x >= width || y >= height) return;
+    if (y >= height) return;
+    if (mode == 0) {
+        uint x = id.x * 2;
+        if (x >= width) return;
+        uint a = at16 + y * pitch16 + x * 2;
+        uint b = at32 + y * pitch32 + x * 4;
+        bool two = x + 1 < width;
+        if (toDepth != 0) {
+            uint pair = buf.Load(a);
+            buf.Store(b, d24(pair & 0xffff));
+            if (two) buf.Store(b + 4, d24(pair >> 16));
+        } else {
+            uint lo = u16(buf.Load(b));
+            uint hi = two ? u16(buf.Load(b + 4)) : 0;
+            buf.Store(a, lo | hi << 16);
+        }
+        return;
+    }
+    uint x = id.x;
+    if (x >= width) return;
     uint a = at16 + y * pitch16 + x * 2;
     uint b = at32 + y * pitch32 + x * 4;
-    bool two = x + 1 < width;
     if (toDepth != 0) {
-        uint pair = buf.Load(a);
-        buf.Store(b, d24(pair & 0xffff));
-        if (two) buf.Store(b + 4, d24(pair >> 16));
+        // The twin's R8G8B8A8 to the console's packed bits.
+        uint rgba = buf.Load(b);
+        uint r = rgba & 0xff, g = (rgba >> 8) & 0xff, bl = (rgba >> 16) & 0xff, al = (rgba >> 24) & 0xff;
+        uint w;
+        if (mode == 1) w = down(bl, 31) | down(g, 63) << 5 | down(r, 31) << 11;
+        else if (mode == 2) w = down(bl, 31) | down(g, 31) << 5 | down(r, 31) << 10 | (al > 127 ? 1u : 0u) << 15;
+        else w = down(bl, 15) | down(g, 15) << 4 | down(r, 15) << 8 | down(al, 15) << 12;
+        buf.Store(a, w);
     } else {
-        uint lo = u16(buf.Load(b));
-        uint hi = two ? u16(buf.Load(b + 4)) : 0;
-        buf.Store(a, lo | hi << 16);
+        // The console's packed bits to the twin's R8G8B8A8.
+        uint w = buf.Load(a) & 0xffff;
+        uint rgba;
+        if (mode == 1) rgba = up(w >> 11 & 31, 31) | up(w >> 5 & 63, 63) << 8 | up(w & 31, 31) << 16 | 0xff000000u;
+        else if (mode == 2) rgba = up(w >> 10 & 31, 31) | up(w >> 5 & 31, 31) << 8 | up(w & 31, 31) << 16 | (w >> 15 & 1) * 255 << 24;
+        else rgba = up(w >> 8 & 15, 15) | up(w >> 4 & 15, 15) << 8 | up(w & 15, 15) << 16 | up(w >> 12 & 15, 15) << 24;
+        buf.Store(b, rgba);
     }
 }
 "#;

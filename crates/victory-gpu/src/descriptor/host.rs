@@ -1239,6 +1239,14 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 return crate::twin::uav(resource, &copy, desc.as_ref(), at)
                     .map(|twin| Some((twin, None)));
             }
+            // A packed colour texture's unordered views write its twin.
+            // SAFETY: a live resource.
+            if unsafe { texture.GetDesc() }.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0
+                && crate::resource::title_format(resource).is_some_and(crate::twin::packed)
+            {
+                return crate::twin::uav(resource, &copy, desc.as_ref(), at)
+                    .map(|twin| Some((twin, None)));
+            }
             let mut desc = desc.as_ref().map(uav_desc);
             if desc.is_none() && !default_view(resource) {
                 return None;

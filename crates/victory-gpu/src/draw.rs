@@ -338,21 +338,32 @@ impl State {
                 continue;
             };
             // A texture whose format cannot serve render targets (`B4G4R4A4`
-            // on the host) is made without the flag: drawing goes on without
-            // this target.
+            // on the host) is made without the flag: a packed colour renders
+            // its writable twin, others go on without this target.
             // SAFETY: a live texture.
             let desc = unsafe { texture.GetDesc() };
-            if desc.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 == 0 {
-                once!(
-                    format = desc.Format.0,
-                    "a render target the host cannot render to"
-                );
-                continue;
-            }
+            let (texture, desc) = if desc.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 == 0 {
+                let twin = crate::resource::host_copy(record.resource)
+                    .and_then(|copy| crate::twin::rtv(record.resource, &copy));
+                let Some(plane) = twin else {
+                    once!(
+                        format = desc.Format.0,
+                        "a render target the host cannot render to"
+                    );
+                    continue;
+                };
+                let mut view = record.desc();
+                if let Some(view) = view.as_mut() {
+                    view.Format = DXGI_FORMAT(crate::twin::render_format(view.Format.0 as u32) as i32);
+                }
+                (plane.texture.clone(), view)
+            } else {
+                (texture.clone(), record.desc())
+            };
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
-            rtvs.push(host.rtv(texture, record.desc().as_ref()));
+            rtvs.push(host.rtv(&texture, desc.as_ref()));
         }
         self.depth = 0;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
