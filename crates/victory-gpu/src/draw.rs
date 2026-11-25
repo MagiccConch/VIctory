@@ -104,6 +104,9 @@ impl Drop for State {
 
 /// The key of our own view heap (`crate::memory::heap`) among the title's.
 const MEMORY_HEAP: usize = crate::memory::OURS;
+/// [`State::host_heaps`] slot of the sampler heap of ours (`descriptor::host::sampler_heap`),
+/// bound where no sampler heap of the title's has a host copy.
+const OUR_SAMPLERS: usize = usize::MAX - 1;
 
 /// Dynamic slots taken at a time for root views.
 const ROOT_VIEW_RUN: u32 = 256;
@@ -516,8 +519,9 @@ impl State {
             (self.host_pipeline, self.host_roots[1]) = (0, 0);
         }
         // Heaps first: a root signature with directly indexed heaps must be
-        // set after them. Title memory's views need a view heap: ours where
-        // the title binds none (the BVH builder's dispatches may not).
+        // set after them (a sampler heap is bound here whatever the title
+        // did). Title memory's views need a view heap: ours where the title
+        // binds none (the BVH builder's dispatches may not).
         let memory_heap = self.heaps[0] == 0
             && p.stages.iter().any(|s| s.memory.is_some() || has_root_views(&s.translated().host));
         self.bind_heaps(list, memory_heap);
@@ -832,23 +836,49 @@ impl State {
         Some((index, offset))
     }
 
-    /// Gives the host list the title's heaps if it has others.
+    /// Gives the host list the heaps a root signature with directly
+    /// indexed heaps must find bound: the view heap (ours where the title
+    /// binds none) and a sampler heap — the title's host copy where it has
+    /// one, ours otherwise. The debug layer refuses a root signature with
+    /// `SAMPLER_HEAP_DIRECTLY_INDEXED` set without a sampler heap bound
+    /// (message id 1419), and a shader reading the sampler heap without
+    /// one bound faults the device.
     fn bind_heaps(&mut self, list: &HostList, memory_heap: bool) {
-        let want = if memory_heap {
+        let mut want = if memory_heap {
             [MEMORY_HEAP, self.heaps[1]]
         } else {
             self.heaps
         };
+        // The title's sampler heap bound only once its host copy exists (it
+        // is made on first use, or never for a heap that is not shader
+        // visible): ours until then.
+        let samplers = match want[1] {
+            0 => None,
+            h => crate::descriptor::heap(h as This).host().map(|host| (h, host)),
+        };
+        want[1] = samplers.as_ref().map_or(OUR_SAMPLERS, |&(h, _)| h);
         if self.host_heaps != want {
-            let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = self
-                .heaps
-                .iter()
-                .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
-                .collect();
-            if memory_heap && let Some(h) = crate::memory::heap() {
-                heaps.insert(0, Some(h.heap.clone()));
+            let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = Vec::new();
+            match want[0] {
+                0 => {}
+                MEMORY_HEAP => {
+                    if let Some(h) = crate::memory::heap() {
+                        heaps.push(Some(h.heap.clone()));
+                    }
+                }
+                h => {
+                    if let Some(host) = crate::descriptor::heap(h as This).host() {
+                        heaps.push(Some(host.heap.clone()));
+                    }
+                }
+            }
+            match &samplers {
+                Some((_, host)) => heaps.push(Some(host.heap.clone())),
+                None => {
+                    if let Some(ours) = crate::descriptor::host::sampler_heap() {
+                        heaps.push(Some(ours.clone()));
+                    }
+                }
             }
             heaps.iter().flatten().for_each(|h| list.keep(h));
             // SAFETY: an open list and shader-visible heaps.

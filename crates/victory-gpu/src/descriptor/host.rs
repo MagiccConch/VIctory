@@ -335,6 +335,44 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
+/// Our sampler heap, bound where no sampler heap of the title's has a host
+/// copy (`crate::draw::State::bind_heaps`): a root signature with
+/// `SAMPLER_HEAP_DIRECTLY_INDEXED` must be set with a sampler heap bound,
+/// and a shader reading the sampler heap without one bound faults the
+/// device. Every slot is a plain point sampler: translated shaders clamp
+/// sampler heap indices below [`HEAP_SAMPLERS`], and a slot the title did
+/// not describe reads that (`emit`, "Heap indices").
+pub(crate) fn sampler_heap() -> Option<&'static ID3D12DescriptorHeap> {
+    static HEAP: std::sync::OnceLock<Option<ID3D12DescriptorHeap>> = std::sync::OnceLock::new();
+    HEAP.get_or_init(|| {
+        let host = host()?;
+        // SAFETY: plain heap creation and sampler fills of a heap of ours.
+        unsafe {
+            let heap: ID3D12DescriptorHeap = host
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+                    NumDescriptors: victory_shader::emit::HEAP_SAMPLERS,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .ok()?;
+            crate::host::name(&heap, || "our sampler heap".into());
+            let start = heap.GetCPUDescriptorHandleForHeapStart();
+            let step = host
+                .device
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+            for i in 0..victory_shader::emit::HEAP_SAMPLERS {
+                null_sampler(D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: start.ptr + (i * step) as usize,
+                });
+            }
+            Some(heap)
+        }
+    })
+    .as_ref()
+}
+
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
