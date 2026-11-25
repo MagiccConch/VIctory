@@ -134,8 +134,9 @@ victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
 victory config
 ```
 
-Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
-info and above).
+| `VICTORY_LOG=victory_loader=trace,info` | a release build logs
+info and above; with the `diagnostics` feature, debug and trace too |
+| `VICTORY_LOG_FILE=<file>` | also appends every log record to a file (opened for appending; an unusable path is warned about and ignored) |
 
 ### Windows shader-test validator
 
