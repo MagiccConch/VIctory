@@ -3093,14 +3093,10 @@ impl Host {
             };
             p.copy.reset();
             let list = &p.copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
+            let (first, last) = present_barriers(texture, &back, state);
+            // SAFETY: an open list; the textures are in the states the
+            // barriers name.
+            list.ResourceBarrier(&first);
             list.CopyResource(&back, texture);
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
@@ -3110,14 +3106,7 @@ impl Host {
             let probe = crate::capture::probe(&self.device, list, texture);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+            list.ResourceBarrier(&last);
             p.copy.close();
             self.execute(&[&p.copy]);
             #[cfg(feature = "diagnostics")]
@@ -3487,6 +3476,35 @@ pub(crate) fn transition(
     }
 }
 
+/// The barriers the present's copy records: the texture to the copy source
+/// and the back buffer to the copy destination, then both back. A texture
+/// already in the copy source state (its last list copied from it) takes
+/// no barrier of its own: one whose states are equal is refused when the
+/// list is closed, and the copy keeps the state.
+fn present_barriers(
+    texture: &ID3D12Resource,
+    back: &ID3D12Resource,
+    state: D3D12_RESOURCE_STATES,
+) -> (Vec<D3D12_RESOURCE_BARRIER>, Vec<D3D12_RESOURCE_BARRIER>) {
+    let mut first = Vec::new();
+    let mut last = Vec::new();
+    if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+        first.push(transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE));
+        last.push(transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state));
+    }
+    first.push(transition(
+        back,
+        D3D12_RESOURCE_STATE_PRESENT,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+    ));
+    last.push(transition(
+        back,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        D3D12_RESOURCE_STATE_PRESENT,
+    ));
+    (first, last)
+}
+
 /// A window of the given client size, owned by its own message thread.
 fn window(width: u32, height: u32) -> windows::core::Result<HWND> {
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -3658,5 +3676,62 @@ mod withholding {
             drop(copy);
             crate::watch::tests::free(p);
         }
+    }
+}
+
+#[cfg(test)]
+mod present_barriers {
+    use super::present_barriers;
+    use std::mem::ManuallyDrop;
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET, ID3D12Resource,
+    };
+    use windows::core::Interface;
+
+    /// A resource that is only an address: `as_raw` never runs code on it,
+    /// and `ManuallyDrop` keeps the wrapper from releasing it (there was
+    /// no reference).
+    fn fake() -> (ManuallyDrop<ID3D12Resource>, usize) {
+        let marker = 0u8;
+        let at = std::ptr::from_ref(&marker) as usize;
+        // SAFETY: `ID3D12Resource` is pointer-sized; the wrapper only
+        // carries the address (never dereferenced, no release).
+        let resource = unsafe { std::mem::transmute_copy::<usize, ID3D12Resource>(&at) };
+        let key = resource.as_raw() as usize;
+        (ManuallyDrop::new(resource), key)
+    }
+
+    /// A texture already in the copy source state (its last list copied
+    /// from it) takes no barrier of its own: one whose states are equal is
+    /// refused when the list is closed (`0x80070057`).
+    #[test]
+    fn a_texture_already_in_the_copy_source_state_takes_no_barriers() {
+        let (texture, _texture_key) = fake();
+        let (back, back_key) = fake();
+        let (first, last) = present_barriers(&texture, &back, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        assert_eq!((first.len(), last.len()), (1, 1));
+        assert_eq!(
+            super::tests::issued(),
+            vec![(back_key, 0, 0x400), (back_key, 0x400, 0)],
+            "only the back buffer's barriers"
+        );
+    }
+
+    /// A texture in any other state moves to the copy source and back.
+    #[test]
+    fn a_texture_in_another_state_moves_to_the_copy_source_and_back() {
+        let (texture, texture_key) = fake();
+        let (back, back_key) = fake();
+        let (first, last) = present_barriers(&texture, &back, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        assert_eq!((first.len(), last.len()), (2, 2));
+        assert_eq!(
+            super::tests::issued(),
+            vec![
+                (texture_key, 0x4, 0x800),
+                (back_key, 0, 0x400),
+                (texture_key, 0x800, 0x4),
+                (back_key, 0x400, 0),
+            ]
+        );
     }
 }
