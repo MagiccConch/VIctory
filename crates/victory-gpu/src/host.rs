@@ -1823,9 +1823,17 @@ impl HostList {
         }
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
+            #[cfg(feature = "diagnostics")]
+            let note = close_note();
+            #[cfg(not(feature = "diagnostics"))]
+            let note = String::new();
             fail(format_args!(
-                "a host command list did not close ({e}): a command recorded into it was invalid"
+                "a host command list did not close ({e}): a command recorded into it was invalid{note}"
             ));
+        }
+        #[cfg(feature = "diagnostics")]
+        if states_log_on() {
+            STATES.with(|s| s.borrow_mut().clear());
         }
     }
 
@@ -3225,12 +3233,19 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
     unordered_access_only(legal)
 }
 
-/// A state with render target and unordered access together: the console
-/// serves both views from one state, the host has no such state and
-/// refuses the barrier when the list closes. The unordered side is kept;
-/// render targets re-bind before their draws (`set_targets`), moving the
-/// state back first.
+/// A state the host has no resource for: the console serves a texture's
+/// render targets and unordered views from one state, and writes depth
+/// while unordered views read or write, where the host has neither. The
+/// unordered access side is kept (render targets re-bind before their
+/// draws, `set_targets`, moving the state back first); a depth write is
+/// kept alone (the unordered side is the depth's twin's, `crate::twin`).
 pub(crate) fn unordered_access_only(state: u32) -> u32 {
+    if state & 0x10 != 0 {
+        if state != 0x10 {
+            once!("a depth write state with other state bits: the depth side is kept");
+        }
+        return 0x10;
+    }
     if state & (0x4 | 0x8) == 0x4 | 0x8 {
         once!("a texture in a render target and unordered access state at once: the unordered side is kept");
         state & !0x4
@@ -3484,6 +3499,16 @@ pub(crate) fn transition(
 ) -> D3D12_RESOURCE_BARRIER {
     #[cfg(test)]
     tests::ISSUED.with(|l| l.borrow_mut().push((resource.as_raw() as usize, before.0 as u32, after.0 as u32)));
+    #[cfg(feature = "diagnostics")]
+    if states_log_on() {
+        STATES.with(|s| {
+            let mut s = s.borrow_mut();
+            s.push((resource.as_raw() as usize, before.0 as u32, after.0 as u32));
+            if s.len() > 4096 {
+                s.drain(..2048);
+            }
+        });
+    }
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -3497,6 +3522,59 @@ pub(crate) fn transition(
             }),
         },
     }
+}
+
+/// Whether the per-list transition history is recorded, `VICTORY_D3D12_STATES=1` (diagnostics builds only).
+#[cfg(feature = "diagnostics")]
+fn states_log_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_D3D12_STATES"))
+}
+
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    /// The `(resource, before, after)` of the transitions recorded on this
+    /// thread since its last list close: a list that does not close names
+    /// the exact barrier pairs the debug layer refused.
+    static STATES: std::cell::RefCell<Vec<(usize, u32, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The tail of [`STATES`], formatted `resource before->after`, oldest last; drains it.
+#[cfg(feature = "diagnostics")]
+fn dump_states() -> String {
+    use std::fmt::Write;
+    STATES.with(|s| {
+        let mut s = s.borrow_mut();
+        let pairs = std::mem::take(&mut *s);
+        let start = pairs.len().saturating_sub(8);
+        let mut text = pairs[start..]
+            .iter()
+            .fold(String::new(), |mut text, (resource, before, after)| {
+                let _ = write!(text, "{resource:#x} 0x{before:x}->0x{after:x}, ");
+                text
+            });
+        if !text.is_empty() {
+            text.truncate(text.len() - 2);
+        }
+        if start > 0 {
+            text.insert(0, '\u{2026}');
+        }
+        text
+    })
+}
+
+/// What [`HostList::close`] appends for the close failure to name: the
+/// recorded pairs, `VICTORY_D3D12_STATES=1` only.
+#[cfg(feature = "diagnostics")]
+fn close_note() -> String {
+    if !states_log_on() {
+        return String::new();
+    }
+    let text = dump_states();
+    if text.is_empty() {
+        return String::new();
+    }
+    format!("; barriers recorded since the last close: {text}")
 }
 
 /// The barriers the present's copy records: the texture to the copy source
@@ -3719,6 +3797,16 @@ mod legal_states {
         assert_eq!(super::legal_for(flags, 0x4 | 0x8), 0x8);
         assert_eq!(super::legal_for(flags, 0x8), 0x8);
         assert_eq!(super::legal_for(flags, 0x4), 0x4);
+    }
+
+    /// A depth write with other state bits at once (the console combines
+    /// it with unordered access) is a depth write alone.
+    #[test]
+    fn a_depth_write_state_keeps_only_the_depth_write() {
+        assert_eq!(super::unordered_access_only(0x10 | 0x8), 0x10);
+        assert_eq!(super::unordered_access_only(0x10 | 0x20 | 0x8), 0x10);
+        assert_eq!(super::unordered_access_only(0x10), 0x10);
+        assert_eq!(super::unordered_access_only(0x20 | 0x8), 0x20 | 0x8);
     }
 }
 
