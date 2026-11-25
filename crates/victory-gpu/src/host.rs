@@ -4456,7 +4456,7 @@ impl Host {
             let before = declared.len();
             let kept: Vec<Declared> = declared
                 .into_iter()
-                .filter(|(shadow, _)| !crate::census::is_wc(shadow.title_start()))
+                .filter(|(_, ranges)| !crate::census::all_wc(ranges))
                 .collect();
             crate::census::UNCOMPARED.fetch_add((before - kept.len()) as u64, Ordering::Relaxed);
             kept
@@ -4888,7 +4888,7 @@ impl Host {
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
                         if lo < hi
                             && !seen.contains(&(copy, lo, hi))
-                            && !crate::census::skip_back(r.shadow.title_start(), (hi - lo) as u64)
+                            && !crate::census::skip_back(r.declared, (hi - lo) as u64)
                         {
                             let key = (r.shadow.id(), r.shadow.span().0 as usize + lo, hi - lo);
                             if fetch.as_ref().is_some_and(|f| f.had.holds(behind, key)) {
@@ -5274,7 +5274,7 @@ impl Host {
                 }
                 let (lo, hi) = r.shadow.card_piece(&r.span, p);
                 if lo < hi
-                    && !crate::census::skip_back(r.shadow.title_start(), (hi - lo) as u64)
+                    && !crate::census::skip_back(r.declared, (hi - lo) as u64)
                     && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi))
                 {
                     pieces.push((i, lo, hi, total));
