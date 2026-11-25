@@ -133,9 +133,16 @@ impl HostHeap {
             }
         } else if let Ok(heap) = make((count + DYNAMIC).max(views)) {
             (heap, count, DYNAMIC)
+        } else if let Ok(heap) = make(count + DYNAMIC) {
+            // A host that allows the title's whole range beside the larger
+            // dynamic one, though below `HEAP_VIEWS` (NVIDIA): every title
+            // slot mirrored.
+            (heap, count, DYNAMIC)
+        } else if let Ok(heap) = make(count + MIN_DYNAMIC) {
+            (heap, count, MIN_DYNAMIC)
         } else {
-            // shortcut: a host that caps its heaps below `HEAP_VIEWS` (NVIDIA)
-            // faults on an index past them, as before the clamp.
+            // shortcut: a host that caps its heaps below the title's range
+            // (NVIDIA) faults on an index past them, as before the clamp.
             match make(count + MIN_DYNAMIC) {
                 Ok(heap) => (heap, count, MIN_DYNAMIC),
                 Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
