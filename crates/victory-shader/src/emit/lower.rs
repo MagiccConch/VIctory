@@ -5053,7 +5053,13 @@ impl<'a> Lower<'a> {
             return index;
         }
         let c = self.cur;
-        let last = self.s.m.i32(super::HEAP_VIEWS - 1);
+        // The host heap shaders index: [`HEAP_VIEWS`], or the cap of a host
+        // whose shader-visible view heaps stop below it (NVIDIA). The clamp
+        // and the null pair must stay inside it (`victory-gpu`'s
+        // `descriptor::host` sizes the heap to it and keeps the last slots
+        // null for these reads).
+        let limit = self.s.view_limit.unwrap_or(super::HEAP_VIEWS).min(super::HEAP_VIEWS);
+        let last = self.s.m.i32(limit - 1);
         let over = self.s.m.cmp(c, pred::IUGT, index, last);
         let index = self.s.m.select(c, over, last, index);
         let four = self.s.m.i32(4);
@@ -5065,8 +5071,9 @@ impl<'a> Lower<'a> {
         let stride = self.as_int(x);
         let zero = self.s.m.i32(0);
         let none = self.s.m.cmp(c, pred::EQ, stride, zero);
-        // The null unordered access view sits just below the null SRV.
-        let null = super::NULL_BUFFER_VIEW - u32::from(props.0 & 0x1000 != 0);
+        // The null unordered access view sits just below the null SRV; both
+        // at the heap's last slots, inside a capped heap too.
+        let null = limit - 2 - u32::from(props.0 & 0x1000 != 0);
         let null = self.s.m.i32(null);
         self.s.m.select(c, none, null, index)
     }
