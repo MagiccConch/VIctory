@@ -5074,6 +5074,7 @@ impl Host {
                 let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
                 let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
                 shadow.walls_merged(gpu.len(), merged);
+                crate::census::fetched(shadow.title_start(), gpu.len() as u64);
                 written += merged as u64;
             }
         }
