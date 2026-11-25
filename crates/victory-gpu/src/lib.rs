@@ -66,6 +66,7 @@ pub mod resource;
 pub mod root;
 #[cfg(windows)]
 mod safecopy;
+mod census;
 #[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
@@ -110,6 +111,7 @@ pub fn frame_phase() -> u32 {
     copystat::phase()
 }
 #[cfg(windows)]
+pub use census::title_memory_reserved;
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
