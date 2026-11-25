@@ -1665,12 +1665,14 @@ pub(crate) mod tests {
 
 #[cfg(test)]
 mod host_states {
+    use std::mem::ManuallyDrop;
     use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
     use windows::core::Interface;
 
     /// A resource that is only an address: `as_raw` never runs code on it,
-    /// and its wrapper is forgotten rather than released.
-    fn fake() -> (ID3D12Resource, usize) {
+    /// and `ManuallyDrop` keeps the wrapper from releasing it (there was
+    /// no reference).
+    fn fake() -> (ManuallyDrop<ID3D12Resource>, usize) {
         let marker = 0u8;
         // SAFETY: `ID3D12Resource` is pointer-sized; the wrapper only
         // carries the address (never dereferenced, no release).
@@ -1680,19 +1682,25 @@ mod host_states {
             )
         };
         let key = buffer.as_raw() as usize;
-        (buffer, key)
+        (ManuallyDrop::new(buffer), key)
     }
 
-    /// A buffer written by shaders and read as vertex data takes a barrier
-    /// between the two uses, and the write state keeps it from decaying
-    /// between submissions.
+    /// A buffer written by shaders and read as vertex data: the vertex use
+    /// takes a barrier from the write state, and the write state keeps it
+    /// from decaying between submissions.
     #[test]
     fn vertex_data_after_a_shader_write_takes_a_barrier_that_decay_keeps() {
         let (buffer, key) = fake();
 
-        // From COMMON, either use promotes: no barrier.
+        // From COMMON, a shader write promotes: no barrier.
         assert_eq!(super::taking(&buffer, super::UNORDERED_ACCESS), None);
-        assert_eq!(super::taking(&buffer, super::VERTEX_AND_CONSTANT), None);
+
+        // The draw reads the same copy as vertex data: an explicit
+        // transition, UAV does not become a vertex buffer on its own.
+        assert_eq!(
+            super::taking(&buffer, super::VERTEX_AND_CONSTANT),
+            Some((0x8, 0x9))
+        );
         assert_eq!(super::states().get(&key), Some(&0x9), "both bits stand");
 
         // Nothing more between the two uses.
@@ -1709,7 +1717,6 @@ mod host_states {
         // When the copy goes, so does the state.
         super::forgotten(&buffer);
         assert_eq!(super::states().get(&key), None);
-        std::mem::forget(buffer);
     }
 
     /// A buffer only read as vertex data decays to COMMON: the next
@@ -1722,6 +1729,5 @@ mod host_states {
         assert_eq!(super::states().get(&key), None, "COMMON: the entry is gone");
         assert_eq!(super::taking(&buffer, super::VERTEX_AND_CONSTANT), None);
         super::forgotten(&buffer);
-        std::mem::forget(buffer);
     }
 }
