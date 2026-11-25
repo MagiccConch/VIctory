@@ -3878,12 +3878,14 @@ mod legal_states {
         assert_eq!(super::unordered_access_only(0x20 | 0x8), 0x20 | 0x8);
     }
 
-    /// A render target with other bits at once keeps its other side when
-    /// there is unordered access (whose writes the console reads as its
-    /// targets), the render target alone otherwise.
+    /// A render target with other bits at once is a render target alone
+    /// (its uses re-bind the state, `set_targets`; the other sides re-issue
+    /// their own barriers); with unordered access the unordered side is
+    /// kept, the console reading its target writes as unordered ones (the
+    /// previous test).
     #[test]
     fn a_render_target_with_other_state_bits() {
-        assert_eq!(super::unordered_access_only(0x4 | 0x400), 0x400);
+        assert_eq!(super::unordered_access_only(0x4 | 0x400), 0x4);
         assert_eq!(super::unordered_access_only(0x4 | 0x1), 0x4);
         assert_eq!(super::unordered_access_only(0x4), 0x4);
     }
@@ -3904,11 +3906,14 @@ mod legal_states {
         assert_eq!(super::fixed_state(false, flags, 0x100 | 0x40), (0x40, true));
         // depth write exclusivity and render target exclusivity held
         assert_eq!(super::fixed_state(false, flags, 0x10 | 0x8), (0x10, true));
-        assert_eq!(super::fixed_state(false, flags, 0x4 | 0x400), (0x400, true));
+        assert_eq!(super::fixed_state(false, flags, 0x4 | 0x400), (0x4, true));
         // legal multi-bit states pass unchanged
         assert_eq!(super::fixed_state(false, flags, 0x840), (0x840, false));
         assert_eq!(super::fixed_state(false, flags, 0xE0), (0xE0, false));
-        assert_eq!(super::fixed_state(false, flags, 0x2A8), (0x2A8, false));
+        // a buffer keeps its buffer states, a texture loses the buffer-only
+        // ones and the depth read it cannot take
+        assert_eq!(super::fixed_state(true, 0, 0x288), (0x288, false));
+        assert_eq!(super::fixed_state(false, flags, 0x2A8), (0xA8, true));
     }
 }
 
@@ -3919,13 +3924,11 @@ fn flag_all() -> u32 {
     use windows::Win32::Graphics::Direct3D12::{
         D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
         D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-        D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE,
     };
     (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
         | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
         | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL
-        | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS
-        | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)
+        | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS)
         .0 as u32
 }
 
