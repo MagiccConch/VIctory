@@ -20,7 +20,8 @@ pub(crate) struct HostHeap {
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
     /// Dynamic slots past `count` (none in sampler heaps): [`DYNAMIC`]
-    /// where the host takes them, else [`MIN_DYNAMIC`].
+    /// where the host takes them, else fewer title slots mirrored on a
+    /// capped heap ([`DYNAMIC`] still, over the title's slots past it).
     dynamic: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
@@ -89,7 +90,7 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// View-pair slots a capped view heap reserves for copy-back view pairs
 /// (`HostHeap::pair`, `crate::memory`): 16384 pairs, freed and reused as
 /// their copy-backs run. 2026-11-25 (run 7): without their own range, pairs
-/// starved with the dynamic range sized `MIN_DYNAMIC - 1` and never freed.
+/// starved and never freed, losing the pages their copy-backs carried.
 const CAPPED_PAIRS: u32 = 1 << 15;
 
 /// The size of a capped view heap if `device` takes no larger
@@ -113,12 +114,14 @@ pub(crate) fn view_heap_cap(device: &ID3D12Device) -> Option<u32> {
 /// afresh (constant buffers copied per draw). A list holds the slots it
 /// took until it is reset (its submissions have run) or released.
 /// 2^16 ran out seconds into the world (every world run on an RX 9070 XT,
-/// each a device removal shortly after; #59).
+/// each a device removal shortly after; #59), and on a capped heap
+/// (NVIDIA, 1,000,000 slots) it starved the world's tables: indirect and
+/// mesh draws dropped as "no dynamic slots", the G-buffer about 0.1%
+/// covered; 2^18 with fewer title slots mirrored raised that to 60-65%
+/// and dropped nothing for lack of slots (upstream issue #747, measured
+/// on an RTX 4070 Ti). So a capped heap takes these too, over title slots
+/// past it — a title that reaches them needs remapping either way.
 const DYNAMIC: u32 = 1 << 18;
-
-/// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
-/// (a capped heap, NVIDIA): the title's slots keep their room first.
-const MIN_DYNAMIC: u32 = 1 << 16;
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -190,15 +193,10 @@ impl HostHeap {
             // dynamic one, though below `HEAP_VIEWS` (NVIDIA): every title
             // slot mirrored.
             (heap, count, DYNAMIC)
-        } else if let Ok(heap) = make((count + MIN_DYNAMIC).max(views)) {
-            // The same for the smaller dynamic range.
-            (heap, count, MIN_DYNAMIC - 3 * u32::from(cap == Some(count + MIN_DYNAMIC)))
-        } else if let Ok(heap) = make(count + MIN_DYNAMIC) {
-            (heap, count, MIN_DYNAMIC)
         } else {
-            match make(count + MIN_DYNAMIC) {
-                Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(_e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
+            match make(count + DYNAMIC) {
+                Ok(heap) => (heap, count, DYNAMIC),
+                Err(_e) if count + DYNAMIC > PORTABLE_VIEWS => {
                     // shortcut: title slots past the host's cap are left out;
                     // a title that reaches them needs remapping (a shader's
                     // index past the heap reads the cap's last slot, which no
@@ -208,12 +206,14 @@ impl HostHeap {
                     // null SRV/UAV for computed buffer-view indices must sit
                     // inside the heap (2026-11-25, run 7's warn "no room for
                     // the null buffer views" and copy-back pairs lost at the
-                    // cap).
+                    // cap). Title slots give way first: 2^16 dynamic slots
+                    // starved the world's tables on the capped heap (upstream
+                    // #747, 0.1% G-buffer coverage), 2^18 filled it.
                     match make(PORTABLE_VIEWS) {
                         Ok(heap) => {
-                            let title = PORTABLE_VIEWS - MIN_DYNAMIC - CAPPED_PAIRS - 3;
+                            let title = PORTABLE_VIEWS - DYNAMIC - CAPPED_PAIRS - 3;
                             tracing::warn!(count, kept = title, "host view heap capped at {PORTABLE_VIEWS}");
-                            (heap, count.min(title), MIN_DYNAMIC)
+                            (heap, count.min(title), DYNAMIC)
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, count, sampler, "no host descriptor heap");

@@ -1164,6 +1164,13 @@ impl State {
             }
         }
         let mut made = Vec::new();
+        // Ranges this call allocated: a rejected bind (a fresh table
+        // without dynamic slots) keeps none of them — they were never
+        // recorded into the list (the draw is dropped before its root
+        // arguments are set), and a later draw re-makes them from scratch
+        // (upstream issue #911: retained reservations amplified heap
+        // exhaustion; here they are given back at once).
+        let mut just: Vec<(usize, u32, u32, (u64, u64))> = Vec::new();
         for slot in fresh {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
@@ -1217,6 +1224,7 @@ impl State {
             self.fresh_tables.insert(key, first);
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
+            just.push((std::ptr::from_ref(heap) as usize, first, n, key));
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -1238,6 +1246,19 @@ impl State {
                 }
             }
             made.push((slot, first * 32));
+        }
+        if self.table_failed {
+            // Give back what this call reserved: the bind is rejected, and
+            // these ranges were never recorded into the list.
+            for (heap, first, n, key) in just {
+                self.fresh_tables.remove(&key);
+                self.dynamic.retain(|d| !(d.0 == heap && d.1 == first));
+                // SAFETY: the heap lives while its device does, as in
+                // `self.dynamic`'s held entries.
+                let host = unsafe { &*(heap as *const crate::descriptor::host::HostHeap) };
+                host.release(first, n);
+            }
+            made.clear();
         }
         made
     }
