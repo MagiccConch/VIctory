@@ -20,9 +20,78 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+use windows::core::Interface as _;
 
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
+
+/// Host states the copy's buffer moves between (`D3D12_RESOURCE_STATES`).
+/// A read state (`VERTEX_AND_CONSTANT`) decays to `COMMON` at an
+/// ExecuteCommandLists boundary; a write state (`UNORDERED_ACCESS`) does
+/// not.
+const COMMON: u32 = 0;
+const UNORDERED_ACCESS: u32 = 0x8;
+const VERTEX_AND_CONSTANT: u32 = 0x1;
+
+/// The host state (a mask of the bits above) each copy buffer is in when
+/// the lists of the submission being recorded run, by resource. A buffer
+/// can serve several copies at once ([`Arena`] chunks hold hundreds of
+/// small views' copies), and one copy can be written by shaders and read
+/// as vertex data in one submission: the states combine.
+fn states() -> std::sync::MutexGuard<'static, std::collections::HashMap<usize, u32>> {
+    static STATES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, u32>>> =
+        std::sync::OnceLock::new();
+    STATES
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// `buffer` takes the `bits` on the list: the transition to record, if the
+/// mask needs a barrier. From `COMMON` nothing is recorded (a state there
+/// promotes on use); between two non-`COMMON` masks D3D12 needs an explicit
+/// barrier (a buffer in `UNORDERED_ACCESS` is not a vertex buffer without
+/// one, and the reverse). The mask only grows: a buffer can be written by
+/// shaders and read as vertex data in one submission, and a write state
+/// (`UNORDERED_ACCESS`) keeps it from decaying between submissions.
+fn ensure_state(buffer: &ID3D12Resource, list: &HostList, bits: u32) {
+    let Some((before, after)) = taking(buffer, bits) else {
+        return;
+    };
+    let barrier = crate::host::transition(
+        buffer,
+        windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES(before as i32),
+        windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES(after as i32),
+    );
+    // SAFETY: an open list and a live buffer.
+    unsafe { list.list.ResourceBarrier(&[barrier]) };
+}
+
+/// What `buffer` does to take `bits`: the barrier (before, after), none if
+/// none is needed. Records the mask either way.
+#[cfg_attr(not(test), allow(dead_code))]
+fn taking(buffer: &ID3D12Resource, bits: u32) -> Option<(u32, u32)> {
+    let mut states = states();
+    let before = states.entry(buffer.as_raw() as usize).or_insert(COMMON);
+    if bits & !*before == 0 {
+        return None;
+    }
+    let (before, after) = (*before, *before | bits);
+    *states.get_mut(&(buffer.as_raw() as usize)).unwrap() = after;
+    (before != COMMON).then_some((before, after))
+}
+
+/// After a submission has run: a buffer promoted to a read state decays to
+/// `COMMON` at an ExecuteCommandLists boundary; a write state
+/// (`UNORDERED_ACCESS`) does not, so a mask holding it stands.
+pub(crate) fn decay_all() {
+    states().retain(|_, mask| *mask & UNORDERED_ACCESS != 0);
+}
+
+/// A copy's buffer goes: its state entry goes with it.
+pub(crate) fn forgotten(buffer: &ID3D12Resource) {
+    states().remove(&(buffer.as_raw() as usize));
+}
 
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
@@ -270,7 +339,23 @@ impl Shadow {
     /// the pages they marked are compared ([`Shadow::copy_back_marked`]).
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64, marked: bool) {
         let len = len.min(self.left(address));
+        if len > 0 {
+            ensure_state(&self.buffer, list, UNORDERED_ACCESS);
+        }
         list.defer_gpu_write(self, address as usize, len as usize, marked && self.marked());
+    }
+
+    /// Draws read the copy as vertex and index data: the buffer must be in
+    /// a vertex-buffer-legal state, not `UNORDERED_ACCESS` (which a shader
+    /// write left it in, and which does not decay at all).
+    pub(crate) fn as_vertex_data(self: &Arc<Self>, list: &HostList) {
+        ensure_state(&self.buffer, list, VERTEX_AND_CONSTANT);
+    }
+
+    /// Shaders may write the copy through unordered views: the buffer takes
+    /// the `UNORDERED_ACCESS` bit if it does not have it.
+    pub(crate) fn ensure_uav(self: &Arc<Self>, list: &HostList) {
+        ensure_state(&self.buffer, list, UNORDERED_ACCESS);
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
@@ -648,6 +733,12 @@ impl Shadow {
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        // A buffer of its own goes with the copy. A shared chunk's entry
+        // stands: other copies run in it, and its state (a write state is
+        // kept across submissions) outlives any of them.
+        if self.slice.is_none() {
+            crate::shadow::forgotten(&self.buffer);
+        }
         if let Some(slice) = self.slice {
             arena().give_back(slice);
         }
@@ -1569,5 +1660,68 @@ pub(crate) mod tests {
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+    }
+}
+
+#[cfg(test)]
+mod host_states {
+    use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+    use windows::core::Interface;
+
+    /// A resource that is only an address: `as_raw` never runs code on it,
+    /// and its wrapper is forgotten rather than released.
+    fn fake() -> (ID3D12Resource, usize) {
+        let marker = 0u8;
+        // SAFETY: `ID3D12Resource` is pointer-sized; the wrapper only
+        // carries the address (never dereferenced, no release).
+        let buffer = unsafe {
+            std::mem::transmute_copy::<usize, ID3D12Resource>(
+                &(std::ptr::from_ref(&marker) as usize),
+            )
+        };
+        let key = buffer.as_raw() as usize;
+        (buffer, key)
+    }
+
+    /// A buffer written by shaders and read as vertex data takes a barrier
+    /// between the two uses, and the write state keeps it from decaying
+    /// between submissions.
+    #[test]
+    fn vertex_data_after_a_shader_write_takes_a_barrier_that_decay_keeps() {
+        let (buffer, key) = fake();
+
+        // From COMMON, either use promotes: no barrier.
+        assert_eq!(super::taking(&buffer, super::UNORDERED_ACCESS), None);
+        assert_eq!(super::taking(&buffer, super::VERTEX_AND_CONSTANT), None);
+        assert_eq!(super::states().get(&key), Some(&0x9), "both bits stand");
+
+        // Nothing more between the two uses.
+        assert_eq!(super::taking(&buffer, super::VERTEX_AND_CONSTANT), None);
+
+        // A read state decays at the boundary; a write state does not.
+        super::decay_all();
+        assert_eq!(super::states().get(&key), Some(&0x9), "the write state stands");
+
+        // So the next submission takes no barrier either way.
+        assert_eq!(super::taking(&buffer, super::VERTEX_AND_CONSTANT), None);
+        assert_eq!(super::taking(&buffer, super::UNORDERED_ACCESS), None);
+
+        // When the copy goes, so does the state.
+        super::forgotten(&buffer);
+        assert_eq!(super::states().get(&key), None);
+        std::mem::forget(buffer);
+    }
+
+    /// A buffer only read as vertex data decays to COMMON: the next
+    /// submission promotes again, no barrier.
+    #[test]
+    fn a_read_only_state_decays_and_promotes_again() {
+        let (buffer, key) = fake();
+        assert_eq!(super::taking(&buffer, super::VERTEX_AND_CONSTANT), None);
+        super::decay_all();
+        assert_eq!(super::states().get(&key), None, "COMMON: the entry is gone");
+        assert_eq!(super::taking(&buffer, super::VERTEX_AND_CONSTANT), None);
+        super::forgotten(&buffer);
+        std::mem::forget(buffer);
     }
 }

@@ -1335,6 +1335,9 @@ impl Host {
             }
             #[cfg(feature = "diagnostics")]
             crate::resource::life::note(0, crate::resource::life::RAN, *submitted, 0);
+            // The copy buffers decay at the boundary: the next submission's
+            // uses promote from COMMON as needed.
+            crate::shadow::decay_all();
             #[cfg(feature = "diagnostics")]
             if groups.len() > 1 {
                 // SAFETY: a plain query.

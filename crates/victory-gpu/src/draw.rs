@@ -567,6 +567,7 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            shadow.as_vertex_data(list);
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -586,6 +587,7 @@ impl State {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            shadow.as_vertex_data(list);
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -699,6 +701,11 @@ impl State {
                 .flatten()
             {
                 list.defer_heap(&host.viewed);
+                if writes {
+                    for shadow in host.viewed.writing_buffers() {
+                        shadow.ensure_uav(list);
+                    }
+                }
             }
             crate::bindless::note_draw(writes);
         }

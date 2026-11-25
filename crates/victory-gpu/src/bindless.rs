@@ -147,6 +147,18 @@ impl Viewed {
     fn ranges(&self) -> Vec<Hull> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).hulls.values().cloned().collect()
     }
+
+    /// Every copy the heap's unordered views reach: shaders of a run may
+    /// write there (`shadow::ensure_state` makes the buffers legal for it).
+    pub(crate) fn writing_buffers(&self) -> Vec<Arc<crate::shadow::Shadow>> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner
+            .hulls
+            .iter()
+            .filter(|&(_, hull)| hull.3)
+            .map(|(_, hull)| hull.0.clone())
+            .collect()
+    }
 }
 
 /// What a made view reads that title memory feeds.
