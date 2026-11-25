@@ -1821,19 +1821,18 @@ impl HostList {
                 self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
             }
         }
+        // The note drains the buffer and files it, before the close and
+        // for success and failure alike: the failure's note is the one
+        // used; the file keeps the history of every list.
+        #[cfg(feature = "diagnostics")]
+        let note = if states_log_on() { close_note() } else { String::new() };
+        #[cfg(not(feature = "diagnostics"))]
+        let note = String::new();
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
-            #[cfg(feature = "diagnostics")]
-            let note = close_note();
-            #[cfg(not(feature = "diagnostics"))]
-            let note = String::new();
             fail(format_args!(
                 "a host command list did not close ({e}): a command recorded into it was invalid{note}"
             ));
-        }
-        #[cfg(feature = "diagnostics")]
-        if states_log_on() {
-            STATES.with(|s| s.borrow_mut().clear());
         }
     }
 
@@ -3270,10 +3269,16 @@ pub(crate) const BUFFER_ONLY: u32 = 0x1 | 0x2 | 0x100 | 0x200;
 /// Every barrier goes through [`transition`], ours and the title's, so a
 /// list that closes is one the debug layer has accepted.
 fn legal_pair(resource: &ID3D12Resource, before: u32, after: u32) -> (u32, u32) {
-    // Exclusivity is a value problem: a state with a render target or a
-    // depth write among other bits is refused whatever the resource is.
-    // Buffer states on a texture need the resource's kind for.
-    let exclusive = |state: u32| (state & 0x10 != 0 && state != 0x10) || (state & 0x4 != 0 && state != 0x4);
+    // Exclusivity is a value problem: a state with a render target, a
+    // depth write, a copy's both sides or a resolve's both sides among
+    // other bits is refused whatever the resource is. Buffer states on a
+    // texture need the resource's kind for.
+    let exclusive = |state: u32| {
+        (state & 0x10 != 0 && state != 0x10)
+            || (state & 0x4 != 0 && state != 0x4)
+            || (state & (0x400 | 0x800) == 0x400 | 0x800)
+            || (state & (0x1000 | 0x2000) == 0x1000 | 0x2000)
+    };
     if !exclusive(before) && !exclusive(after) && (before | after) & BUFFER_ONLY == 0 {
         return (before, after);
     }
@@ -3297,15 +3302,29 @@ fn legal_pair(resource: &ID3D12Resource, before: u32, after: u32) -> (u32, u32) 
 }
 
 /// `state` made host-legal for a buffer or a texture of `flags`: the
-/// changed one and whether it changed.
+/// changed one and whether it changed. A copy's or a resolve's both sides
+/// at once keeps the destination: the write side; the read side re-issues
+/// its own barrier.
 fn fixed_state(buffer: bool, flags: u32, state: u32) -> (u32, bool) {
+    let mut state = state;
+    let mut clamped = false;
+    if state & (0x400 | 0x800) == 0x400 | 0x800 {
+        once!("a copy destination and source state at once: the destination is kept");
+        state &= !0x800;
+        clamped = true;
+    }
+    if state & (0x1000 | 0x2000) == 0x1000 | 0x2000 {
+        once!("a resolve destination and source state at once: the destination is kept");
+        state &= !0x2000;
+        clamped = true;
+    }
     let fixed = if buffer {
         // Buffers cannot be render targets or depth targets.
         state & !(0x4 | 0x10 | 0x20)
     } else {
         legal_for(flags, state & !BUFFER_ONLY)
     };
-    (fixed, fixed != state)
+    (fixed, clamped || fixed != state)
 }
 
 /// The warning for a state made host-legal: what it was, what it became.
@@ -3564,7 +3583,12 @@ pub(crate) fn transition(
     // other bits, buffer states on a texture) are made host-legal before
     // the list records them, so a list that closes is one the layer has
     // already accepted.
-    let (before, after) = legal_pair(resource, before.0 as u32, after.0 as u32);
+    let asked = (before.0 as u32, after.0 as u32);
+    let (before, after) = legal_pair(resource, asked.0, asked.1);
+    #[cfg(feature = "diagnostics")]
+    if (before, after) != asked {
+        CLAMPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let (before, after) = (D3D12_RESOURCE_STATES(before as i32), D3D12_RESOURCE_STATES(after as i32));
     #[cfg(test)]
     tests::ISSUED.with(|l| l.borrow_mut().push((resource.as_raw() as usize, before.0 as u32, after.0 as u32)));
@@ -3572,9 +3596,12 @@ pub(crate) fn transition(
     if states_log_on() {
         STATES.with(|s| {
             let mut s = s.borrow_mut();
-            s.push((resource.as_raw() as usize, before.0 as u32, after.0 as u32));
-            if s.len() > 4096 {
-                s.drain(..2048);
+            let pair = (resource.as_raw() as usize, before.0 as u32, after.0 as u32);
+            if s.last() != Some(&pair) {
+                s.push(pair);
+            }
+            if s.len() > 65536 {
+                s.drain(..32768);
             }
         });
     }
@@ -3608,42 +3635,104 @@ thread_local! {
     static STATES: std::cell::RefCell<Vec<(usize, u32, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// The tail of [`STATES`], formatted `resource before->after`, oldest last; drains it.
+/// Transitions whose states the host refused and the funnel made legal: a
+/// count greater than none says this build's sanitizer ran.
 #[cfg(feature = "diagnostics")]
-fn dump_states() -> String {
+static CLAMPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The tail of `pairs`, formatted `resource before->after`, oldest last:
+/// the last 32 distinct pairs, ellipsis-prefixed when older ones are cut.
+#[cfg(feature = "diagnostics")]
+fn states_tail(pairs: &[(usize, u32, u32)]) -> String {
     use std::fmt::Write;
-    STATES.with(|s| {
-        let mut s = s.borrow_mut();
-        let pairs = std::mem::take(&mut *s);
-        let start = pairs.len().saturating_sub(8);
-        let mut text = pairs[start..]
-            .iter()
-            .fold(String::new(), |mut text, (resource, before, after)| {
-                let _ = write!(text, "{resource:#x} 0x{before:x}->0x{after:x}, ");
-                text
-            });
-        if !text.is_empty() {
-            text.truncate(text.len() - 2);
+    let mut shown: Vec<&(usize, u32, u32)> = Vec::new();
+    for pair in pairs {
+        if shown.last() != Some(&pair) {
+            shown.push(pair);
         }
-        if start > 0 {
-            text.insert(0, '\u{2026}');
-        }
-        text
-    })
+    }
+    let start = shown.len().saturating_sub(32);
+    let mut text = shown[start..]
+        .iter()
+        .fold(String::new(), |mut text, &&(resource, before, after)| {
+            let _ = write!(text, "{resource:#x} 0x{before:x}->0x{after:x}, ");
+            text
+        });
+    if !text.is_empty() {
+        text.truncate(text.len() - 2);
+    }
+    if start > 0 {
+        text.insert(0, '\u{2026}');
+    }
+    text
 }
 
-/// What [`HostList::close`] appends for the close failure to name: the
-/// recorded pairs, `VICTORY_D3D12_STATES=1` only.
+/// Appends every pair to the run's transition history,
+/// `%TEMP%\victory-states.log`, a blank line at each close; answers with
+/// the path. The layer's complaint about a state names no barrier: the
+/// file keeps what the note's tail cannot, so the invalid pair is always
+/// there.
+#[cfg(feature = "diagnostics")]
+fn file_states(pairs: &[(usize, u32, u32)]) -> Option<&'static str> {
+    static PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let name = PATH.get_or_init(|| {
+        let path = std::env::temp_dir().join("victory-states.log");
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .ok()?;
+        Some(path.to_string_lossy().into_owned())
+    });
+    let name = name.as_ref()?;
+    if pairs.is_empty() {
+        return Some(name);
+    }
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    use std::fmt::Write;
+    let mut text = pairs.iter().fold(String::new(), |mut text, &(resource, before, after)| {
+        let _ = writeln!(text, "{resource:#x} 0x{before:x}->0x{after:x}");
+        text
+    });
+    text.push('\n');
+    // The file only grows: start it over past 16 MiB.
+    if std::fs::metadata(name).is_ok_and(|m| m.len() > 16 << 20) {
+        let _ = std::fs::write(name, "");
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(name)
+        .ok()?;
+    use std::io::Write as _;
+    file.write_all(text.as_bytes()).ok()?;
+    Some(name)
+}
+
+/// What [`HostList::close`] appends for the close failure to name: the tail
+/// of the recorded pairs, the full history's path and how many pairs the
+/// sanitizer made host-legal, `VICTORY_D3D12_STATES=1` only. It drains the
+/// buffer and files it, at every close.
 #[cfg(feature = "diagnostics")]
 fn close_note() -> String {
     if !states_log_on() {
         return String::new();
     }
-    let text = dump_states();
-    if text.is_empty() {
-        return String::new();
+    let pairs = STATES.with(|s| std::mem::take(&mut *s.borrow_mut()));
+    let path = file_states(&pairs);
+    let text = states_tail(&pairs);
+    let clamped = CLAMPED.load(Ordering::Relaxed);
+    let mut note = String::new();
+    if !text.is_empty() {
+        note.push_str("; barriers recorded since the last close: ");
+        note.push_str(&text);
     }
-    format!("; barriers recorded since the last close: {text}")
+    if let Some(path) = path {
+        note.push_str(&format!("; every transition of this run: {path}"));
+    }
+    note.push_str(&format!("; pairs made host-legal: {clamped}"));
+    note
 }
 
 /// The barriers the present's copy records: the texture to the copy source
@@ -3914,6 +4003,11 @@ mod legal_states {
         // ones and the depth read it cannot take
         assert_eq!(super::fixed_state(true, 0, 0x288), (0x288, false));
         assert_eq!(super::fixed_state(false, flags, 0x2A8), (0xA8, true));
+        // a copy's or a resolve's both sides at once keeps the destination
+        assert_eq!(super::fixed_state(true, 0, 0x400 | 0x800), (0x400, true));
+        assert_eq!(super::fixed_state(false, flags, 0x400 | 0x800), (0x400, true));
+        assert_eq!(super::fixed_state(true, 0, 0x1000 | 0x2000), (0x1000, true));
+        assert_eq!(super::fixed_state(false, flags, 0x1000 | 0x2000), (0x1000, true));
     }
 }
 
