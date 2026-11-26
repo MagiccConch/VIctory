@@ -6396,7 +6396,9 @@ impl OutputViews<'_> {
         unsafe { self.device.CreateDepthStencilView(resource, desc.map(std::ptr::from_ref), slot) };
         slot
     }
+}
 
+impl Host {
     /// 1-descriptor shader-visible CBV/SRV/UAV fallback heap for directly-indexed root signatures.
     pub(crate) fn fallback_view_heap(&self) -> Option<&ID3D12DescriptorHeap> {
         self.fallback_view

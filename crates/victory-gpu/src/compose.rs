@@ -163,8 +163,13 @@ impl Composer {
                 host.device
                     .CreateShaderResourceView(Some(plane.0), Some(&desc), at);
             }
-            let rtv = host.rtv(Some(back), None);
-            list.OMSetRenderTargets(1, Some(&rtv), false, None);
+            // This thread's own render-target slot (avatarmanz pull request
+            // 42): the list copies it as it records the call.
+            host.output_views(|output| {
+                let rtv = output.rtv(Some(back), None);
+                // SAFETY: an open list; the view was just made.
+                unsafe { list.OMSetRenderTargets(1, Some(&rtv), false, None) };
+            });
             list.SetDescriptorHeaps(&[Some(views.clone())]);
             list.SetGraphicsRootSignature(&self.root);
             list.SetPipelineState(&self.pso);
