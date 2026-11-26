@@ -364,13 +364,14 @@ fn sample() {
     struct Aligned(CONTEXT);
     let mut open: Vec<(u32, *mut std::ffi::c_void)> = Vec::new();
     // `VICTORY_TIMELINE_ALL=1`: also the title's other threads (those with
-    // no name that start outside the system's and our own code), every
-    // millisecond: what the title's busiest threads do outside our calls.
+    // no name that start in its images), every millisecond: what the
+    // title's busiest threads do outside our calls.
     let others: Vec<u32> = if std::env::var_os("VICTORY_TIMELINE_ALL").is_some_and(|v| v == "1") {
-        super::report::Threads::now().unnamed_low()
+        super::report::Threads::now().unnamed_title()
     } else {
         Vec::new()
     };
+    tracing::info!(threads = others.len(), "the sampler also looks at the title's other threads (VICTORY_TIMELINE_ALL)");
     let mut round = 0u32;
     while on() {
         round = round.wrapping_add(1);

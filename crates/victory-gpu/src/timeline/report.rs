@@ -83,12 +83,17 @@ impl Threads {
         threads
     }
 
-    /// The threads with no name that start below the system's and our own
-    /// code (the title's), for the sampler.
-    pub(super) fn unnamed_low(&self) -> Vec<u32> {
+    /// The threads with no name that start in the title's own images (the
+    /// modules the loader names `victory-image-...`), and our relay, submitting
+    /// and records threads, for the sampler.
+    pub(super) fn unnamed_title(&self) -> Vec<u32> {
         self.all
             .iter()
-            .filter(|(_, (_, name, start))| name.is_empty() && *start != 0 && *start >> 40 < 0x7f)
+            .filter(|(_, (_, name, start))| {
+                name.is_empty() && *start != 0 && Names::module(*start).0.starts_with("victory-image-")
+                    || ["victory-relay", "victory-submit"].contains(&name.as_str())
+                    || name.starts_with("victory-records")
+            })
             .map(|(&id, _)| id)
             .collect()
     }
@@ -717,13 +722,18 @@ pub(super) fn chrome(
                 e.b
             )?,
             Kind::Sample => {
-                let stack = (e.stack as usize).checked_sub(1).and_then(|s| stacks.get(s)).map_or(&[][..], |s| &s[..]);
+                let frames = (e.stack as usize).checked_sub(1).and_then(|s| stacks.get(s));
+                // Our own functions on the stack, by name: who made the call
+                // a sample in the system's code is in.
+                let site = frames.map_or(String::new(), |s| names.site(s));
+                let stack = frames.map_or(&[][..], |s| &s[..]);
                 let stack: Vec<String> = stack.iter().take_while(|a| **a != 0).map(|a| format!("{a:#x}")).collect();
                 write!(
                     out,
-                    ",\n{{\"ph\":\"i\",\"s\":\"t\",\"pid\":{pid},\"tid\":{tid},\"ts\":{ts:.1},\"cat\":\"sample\",\"name\":\"{}\",\"args\":{{\"at\":\"{:#x}\",\"stack\":\"{}\"}}}}",
+                    ",\n{{\"ph\":\"i\",\"s\":\"t\",\"pid\":{pid},\"tid\":{tid},\"ts\":{ts:.1},\"cat\":\"sample\",\"name\":\"{}\",\"args\":{{\"at\":\"{:#x}\",\"site\":\"{}\",\"stack\":\"{}\"}}}}",
                     escaped(&names.of(e.a as usize)),
                     e.a,
+                    escaped(&site),
                     stack.join(" ")
                 )?;
             }
