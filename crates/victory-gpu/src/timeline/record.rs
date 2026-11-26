@@ -363,9 +363,29 @@ fn sample() {
     #[repr(C, align(16))]
     struct Aligned(CONTEXT);
     let mut open: Vec<(u32, *mut std::ffi::c_void)> = Vec::new();
+    // `VICTORY_TIMELINE_ALL=1`: also the title's other threads (those with
+    // no name that start in its images), every millisecond: what the
+    // title's busiest threads do outside our calls.
+    let others: Vec<u32> = if std::env::var_os("VICTORY_TIMELINE_ALL").is_some_and(|v| v == "1") {
+        super::report::Threads::now().unnamed_title()
+    } else {
+        Vec::new()
+    };
+    tracing::info!(threads = others.len(), "the sampler also looks at the title's other threads (VICTORY_TIMELINE_ALL)");
+    // `VICTORY_TIMELINE_FAST=<name>`: the threads whose name begins so are
+    // looked at every round (four times as often as the others), for a
+    // profile of one busy thread of ours.
+    let fast: Vec<u32> = match std::env::var("VICTORY_TIMELINE_FAST") {
+        Ok(name) if !name.is_empty() => super::report::Threads::now().named(&name),
+        _ => Vec::new(),
+    };
+    let others: Vec<u32> = others.into_iter().filter(|id| !fast.contains(id)).collect();
+    let mut round = 0u32;
     while on() {
-        for place in &TITLES {
-            let id = place.load(Ordering::Relaxed);
+        round = round.wrapping_add(1);
+        let titles = TITLES.iter().map(|place| place.load(Ordering::Relaxed));
+        let more = others.iter().copied().filter(|_| round.is_multiple_of(4));
+        for id in titles.chain(fast.iter().copied()).chain(more) {
             if id == 0 {
                 continue;
             }
@@ -381,11 +401,12 @@ fn sample() {
             if thread.is_null() {
                 continue;
             }
-            let mut words = [0usize; 64];
+            let mut words = [0usize; 2048];
             // SAFETY: zeroed is a valid CONTEXT; the thread is another one of
             // this process and runs on before anything here allocates or
-            // locks; its stack is read from its pointer to the end of that
-            // page alone.
+            // locks; its stack is read from its pointer up, within the
+            // committed stretch the pointer is in (the stack above it), at
+            // most 16 KiB.
             let at = unsafe {
                 let mut context = Aligned(std::mem::zeroed());
                 context.0.ContextFlags = CONTEXT_CONTROL_AMD64;
@@ -395,7 +416,16 @@ fn sample() {
                 let known = GetThreadContext(thread, &mut context.0) != 0;
                 if known {
                     let sp = context.0.Rsp as usize & !7;
-                    let n = ((sp | 0xfff) + 1 - sp) / 8;
+                    let mut region: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                    let size = size_of::<windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION>();
+                    let end = if windows_sys::Win32::System::Memory::VirtualQuery(sp as *const std::ffi::c_void, &mut region, size) != 0
+                        && region.State == windows_sys::Win32::System::Memory::MEM_COMMIT
+                    {
+                        region.BaseAddress as usize + region.RegionSize
+                    } else {
+                        (sp | 0xfff) + 1
+                    };
+                    let n = ((end - sp) / 8).min(words.len());
                     for (i, word) in words.iter_mut().enumerate().take(n) {
                         *word = (sp as *const usize).add(i).read_volatile();
                     }
@@ -405,9 +435,11 @@ fn sample() {
             };
             let t = ticks();
             // What lies near the instruction may be a return address; where
-            // the instruction is the system's, all of it may tell something.
+            // the instruction is in a module (the system's, the driver's or
+            // ours), the words that point into modules are the ones that may
+            // be return addresses, ours among them further up.
             let mut frames = [0usize; DEPTH];
-            let near = words.iter().copied().filter(|w| *w != 0 && (at >> 40 == 0x7f || w.abs_diff(at) < 0x1000_0000));
+            let near = words.iter().copied().filter(|w| *w != 0 && if at >> 40 == 0x7f { *w >> 40 == 0x7f } else { w.abs_diff(at) < 0x1000_0000 });
             for (frame, word) in frames.iter_mut().zip(near) {
                 *frame = word;
             }

@@ -82,6 +82,27 @@ impl Threads {
         threads.ticks = super::record::ticks();
         threads
     }
+
+    /// The threads with no name that start in the title's own images (the
+    /// modules the loader names `victory-image-...`), and our relay, submitting,
+    /// records and list threads, for the sampler.
+    /// The threads whose name begins with `name`.
+    pub(super) fn named(&self, name: &str) -> Vec<u32> {
+        self.all.iter().filter(|(_, (_, n, _))| n.starts_with(name)).map(|(&id, _)| id).collect()
+    }
+
+    pub(super) fn unnamed_title(&self) -> Vec<u32> {
+        self.all
+            .iter()
+            .filter(|(_, (_, name, start))| {
+                name.is_empty() && *start != 0 && Names::module(*start).0.starts_with("victory-image-")
+                    || ["victory-relay", "victory-submit"].contains(&name.as_str())
+                    || name.starts_with("victory-records")
+                    || name.starts_with("victory-list")
+            })
+            .map(|(&id, _)| id)
+            .collect()
+    }
 }
 
 /// Names of addresses.
@@ -201,9 +222,11 @@ impl Names {
         for &address in stack.iter().take_while(|a| **a != 0) {
             let name = self.of(address);
             let plain = name.trim_start_matches('<').trim_start_matches("impl$").trim_start_matches(|c: char| c.is_ascii_digit());
-            let skipped = ["std::", "core::", "alloc::", "windows_core::", "windows::"].iter().any(|p| plain.starts_with(p))
+            let skipped = ["std::", "core::", "alloc::", "windows_core::", "windows::"].iter().any(|p| plain.starts_with(p)) && !name.contains("Direct3D12::")
                 || ["timeline::hooks::", "timeline::record::"].iter().any(|p| name.contains(p))
-                || ["KERNEL", "ntdll", "kernel"].iter().any(|p| name.starts_with(p));
+                || ["KERNEL", "ntdll", "kernel", "win32u", "D3D12Core", "d3d12", "nvwgf2umx", "VCRUNTIME", "ucrtbase", "?", "RNv", "anon."]
+                    .iter()
+                    .any(|p| name.starts_with(p));
             if !skipped {
                 parts.push(name.replace("victory_gpu::", "").replace("victory_hle::", "hle::"));
             }
@@ -707,13 +730,18 @@ pub(super) fn chrome(
                 e.b
             )?,
             Kind::Sample => {
-                let stack = (e.stack as usize).checked_sub(1).and_then(|s| stacks.get(s)).map_or(&[][..], |s| &s[..]);
+                let frames = (e.stack as usize).checked_sub(1).and_then(|s| stacks.get(s));
+                // Our own functions on the stack, by name: who made the call
+                // a sample in the system's code is in.
+                let site = frames.map_or(String::new(), |s| names.site(s));
+                let stack = frames.map_or(&[][..], |s| &s[..]);
                 let stack: Vec<String> = stack.iter().take_while(|a| **a != 0).map(|a| format!("{a:#x}")).collect();
                 write!(
                     out,
-                    ",\n{{\"ph\":\"i\",\"s\":\"t\",\"pid\":{pid},\"tid\":{tid},\"ts\":{ts:.1},\"cat\":\"sample\",\"name\":\"{}\",\"args\":{{\"at\":\"{:#x}\",\"stack\":\"{}\"}}}}",
+                    ",\n{{\"ph\":\"i\",\"s\":\"t\",\"pid\":{pid},\"tid\":{tid},\"ts\":{ts:.1},\"cat\":\"sample\",\"name\":\"{}\",\"args\":{{\"at\":\"{:#x}\",\"site\":\"{}\",\"stack\":\"{}\"}}}}",
                     escaped(&names.of(e.a as usize)),
                     e.a,
+                    escaped(&site),
                     stack.join(" ")
                 )?;
             }

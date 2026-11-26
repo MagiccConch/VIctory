@@ -309,6 +309,23 @@ pub(crate) fn card_room_kept() -> u64 {
 /// The copies in the card's memory.
 static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 
+/// The same copies by address, and the addresses of those touched since
+/// [`card_dirty`] last looked ([`Shadow::card_changed_runs`]): it looks at
+/// those alone, not at every copy. It ran once a submission over all of
+/// them (3,400 in the house test, 22 submissions a frame), 3% of the
+/// submitting thread there, which is the frame's wall (run S16).
+/// (Each with the title addresses it holds, start and end, so that
+/// [`send_copied`] upgrades only the copies that hold the bytes.)
+static CARDED_AT: Mutex<std::collections::BTreeMap<usize, (usize, usize, std::sync::Weak<Shadow>)>> = Mutex::new(std::collections::BTreeMap::new());
+static TOUCHED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// `shadow`, a copy in the card's memory, is one of [`CARDED`].
+fn carded(shadow: &Arc<Shadow>) {
+    CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(shadow));
+    let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
+    CARDED_AT.lock().unwrap_or_else(|e| e.into_inner()).insert(Arc::as_ptr(shadow) as usize, (start, end, Arc::downgrade(shadow)));
+}
+
 /// Since the last frame line: bytes copied to card sides and the ranges
 /// they were; pieces compared on the card, pieces fetched and their
 /// bytes; the waits for the card the fetches added and their microseconds.
@@ -617,12 +634,30 @@ impl SentRuns {
 /// be merged came after are dropped.
 pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
     let mut out = Vec::new();
-    let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+    // Now and then the copies that are gone are let go of.
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    if CALLS.fetch_add(1, Ordering::Relaxed).is_multiple_of(512) {
+        CARDED.lock().unwrap_or_else(|e| e.into_inner()).retain(|weak| weak.strong_count() > 0);
+        CARDED_AT.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, (_, _, weak)| weak.strong_count() > 0);
+    }
+    let touched = std::mem::take(&mut *TOUCHED.lock().unwrap_or_else(|e| e.into_inner()));
+    // The scan of every copy, as before, in the in-run A/B
+    // (`VICTORY_CARD_TOUCHED` off; diagnostics builds).
+    #[cfg(feature = "diagnostics")]
+    let touched: Vec<usize> = if crate::ab::pick("VICTORY_CARD_TOUCHED") == Some(false) {
+        CARDED_AT.lock().unwrap_or_else(|e| e.into_inner()).keys().copied().collect()
+    } else {
+        touched
+    };
+    if touched.is_empty() {
+        return out;
+    }
+    let shadows: Vec<Arc<Shadow>> = {
+        let at = CARDED_AT.lock().unwrap_or_else(|e| e.into_inner());
+        touched.iter().filter_map(|address| at.get(address)?.2.upgrade()).collect()
+    };
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
-    carded.retain(|weak| {
-        let Some(shadow) = weak.upgrade() else {
-            return false;
-        };
+    for shadow in shadows {
         let ranges = shadow
             .card
             .as_ref()
@@ -641,8 +676,7 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
         if !ranges.is_empty() {
             out.push((shadow, ranges));
         }
-        true
-    });
+    }
     out
 }
 
@@ -724,7 +758,16 @@ pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
 /// CPU side held the same before or not. Left out is what shaders in the air
 /// may be writing (such a copy waits for them, or is done on the card).
 pub(crate) fn send_copied(dst: usize, len: usize) {
-    for shadow in carded_copies() {
+    // Only the copies that hold some of the bytes are upgraded (it was every
+    // copy in the card's memory, 3,400 in the house test, each call).
+    let holding: Vec<Arc<Shadow>> = CARDED_AT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .filter(|(start, end, _)| dst < *end && dst + len > *start)
+        .filter_map(|(_, _, weak)| weak.upgrade())
+        .collect();
+    for shadow in holding {
         let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
         let (from, to) = (dst.max(start), (dst + len).min(end));
         if from >= to {
@@ -1477,6 +1520,14 @@ struct Workers {
 fn spin(there: impl Fn() -> bool) {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let most = *MOST.get_or_init(|| std::env::var("VICTORY_WIDE_SPIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    // In the in-run A/B (diagnostics builds): on, the value set or 100 us.
+    #[cfg(feature = "diagnostics")]
+    let most = match crate::ab::pick("VICTORY_WIDE_SPIN") {
+        Some(true) if most == 0 => 100,
+        Some(true) => most,
+        Some(false) => 0,
+        None => most,
+    };
     if most == 0 {
         return;
     }
@@ -1486,6 +1537,42 @@ fn spin(there: impl Fn() -> bool) {
             std::hint::spin_loop();
         }
     }
+}
+
+/// Whether the threads kept for [`wide`] run above normal priority, as the
+/// submitting thread does (`VICTORY_WIDE_PRIORITY=1`; off by default; flips
+/// with the in-run A/B in diagnostics builds).
+///
+/// Why: a submission's refreshes are spread over these threads and the
+/// submitting thread ([`wide_each`]), which takes the next piece of work as
+/// soon as it has handed them out. With every processor busy (the title's
+/// threads, eight list threads, the pools), a woken helper waited to be
+/// scheduled, and the submitting thread did most of the work alone: in the
+/// house test on an RTX 5080 (run S12) it spent ~46% of its time in such
+/// spreads while the four helpers ran ~11 ms a frame each, and it was the
+/// frame's wall.
+fn wide_priority() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_PRIORITY").is_some_and(|v| v == "1"));
+    #[cfg(feature = "diagnostics")]
+    let on = crate::ab::pick("VICTORY_WIDE_PRIORITY").unwrap_or(on);
+    on
+}
+
+/// A thread that helps the submitting thread ([`wide`]; the pools of
+/// `crate::land` for the title's bytes under flights' writes and the heaps'
+/// records): its priority as [`wide_priority`] says, set when that changes.
+/// `above` is what it was set to.
+pub(crate) fn helper_priority(above: &mut bool) {
+    let wanted = wide_priority();
+    if wanted == *above {
+        return;
+    }
+    *above = wanted;
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_NORMAL};
+    let priority = if wanted { THREAD_PRIORITY_ABOVE_NORMAL } else { THREAD_PRIORITY_NORMAL };
+    // SAFETY: this thread's own priority.
+    unsafe { SetThreadPriority(GetCurrentThread(), priority) };
 }
 
 /// How many threads are kept for [`wide`].
@@ -1506,7 +1593,9 @@ fn workers() -> &'static Workers {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 crate::cores::keep_helper_on_fast_cores("victory-wide");
                 let workers = WORKERS.get().expect("made above");
+                let mut above = false;
                 loop {
+                    helper_priority(&mut above);
                     let job = {
                         // A little while awake first: the next work comes
                         // within microseconds more often than not.
@@ -4326,7 +4415,11 @@ impl Shadow {
             }
         }
         // (Under the lock: what takes the list sees it or finds it set.)
-        card.touched.store(true, Ordering::Release);
+        if !card.touched.swap(true, Ordering::AcqRel) {
+            // Newly touched: [`card_dirty`] looks at it (taken after this
+            // lock there, never the other way round).
+            TOUCHED.lock().unwrap_or_else(|e| e.into_inner()).push(std::ptr::from_ref(self) as usize);
+        }
     }
 
     /// Whether shaders were ever declared to write it.
@@ -5226,7 +5319,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         shadow.card = card;
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
-            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+            carded(&shadow);
         }
         entry.shadow = Some(shadow);
     }
@@ -5432,7 +5525,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         size: len,
     });
     let shadow = Arc::new(shadow);
-    CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+    carded(&shadow);
     Some(shadow)
 }
 
@@ -5536,7 +5629,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     shadow.card = card;
     let shadow = Arc::new(shadow);
     if shadow.card.is_some() {
-        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+        carded(&shadow);
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
