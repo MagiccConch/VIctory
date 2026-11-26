@@ -217,9 +217,11 @@ impl Names {
         for &address in stack.iter().take_while(|a| **a != 0) {
             let name = self.of(address);
             let plain = name.trim_start_matches('<').trim_start_matches("impl$").trim_start_matches(|c: char| c.is_ascii_digit());
-            let skipped = ["std::", "core::", "alloc::", "windows_core::", "windows::"].iter().any(|p| plain.starts_with(p))
+            let skipped = ["std::", "core::", "alloc::", "windows_core::", "windows::"].iter().any(|p| plain.starts_with(p)) && !name.contains("Direct3D12::")
                 || ["timeline::hooks::", "timeline::record::"].iter().any(|p| name.contains(p))
-                || ["KERNEL", "ntdll", "kernel"].iter().any(|p| name.starts_with(p));
+                || ["KERNEL", "ntdll", "kernel", "win32u", "D3D12Core", "d3d12", "nvwgf2umx", "VCRUNTIME", "ucrtbase", "?", "RNv", "anon."]
+                    .iter()
+                    .any(|p| name.starts_with(p));
             if !skipped {
                 parts.push(name.replace("victory_gpu::", "").replace("victory_hle::", "hle::"));
             }
