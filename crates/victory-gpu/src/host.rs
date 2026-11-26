@@ -534,7 +534,11 @@ fn bury(finished: u64) {
 fn bury_aside(finished: u64) {
     static ON: OnceLock<bool> = OnceLock::new();
     static TO: OnceLock<Option<Mutex<std::sync::mpsc::Sender<Vec<(u64, Retired)>>>>> = OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_BURY_ASIDE").is_some_and(|v| v == "1")) {
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_BURY_ASIDE").is_some_and(|v| v == "1"));
+    // Flips with the in-run A/B (`VICTORY_AB`) in diagnostics builds.
+    #[cfg(feature = "diagnostics")]
+    let on = crate::ab::pick("VICTORY_BURY_ASIDE").unwrap_or(on);
+    if !on {
         bury(finished);
         return;
     }
