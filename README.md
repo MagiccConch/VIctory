@@ -21,7 +21,9 @@ faults: [Where it stands](#where-it-stands-2026-11-27).
 
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
 that runs an Xbox Series title natively on Windows from files the user supplies.
-It carries [fxceless/victory-fork](https://github.com/fxceless/victory-fork)
+It loads the title's executable and answers its calls to the console's own
+libraries (`xgameruntime`, `d3d12_xs`, `xmem`) with Windows and Direct3D 12 on
+the PC. It carries [fxceless/victory-fork](https://github.com/fxceless/victory-fork)
 and [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)
 (speed on AMD RDNA 3), with fixes for NVIDIA cards and 32 GB of RAM on top.
 
