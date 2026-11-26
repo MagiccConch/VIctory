@@ -363,9 +363,20 @@ fn sample() {
     #[repr(C, align(16))]
     struct Aligned(CONTEXT);
     let mut open: Vec<(u32, *mut std::ffi::c_void)> = Vec::new();
+    // `VICTORY_TIMELINE_ALL=1`: also the title's other threads (those with
+    // no name that start outside the system's and our own code), every
+    // millisecond: what the title's busiest threads do outside our calls.
+    let others: Vec<u32> = if std::env::var_os("VICTORY_TIMELINE_ALL").is_some_and(|v| v == "1") {
+        super::report::Threads::now().unnamed_low()
+    } else {
+        Vec::new()
+    };
+    let mut round = 0u32;
     while on() {
-        for place in &TITLES {
-            let id = place.load(Ordering::Relaxed);
+        round = round.wrapping_add(1);
+        let titles = TITLES.iter().map(|place| place.load(Ordering::Relaxed));
+        let more = others.iter().copied().filter(|_| round.is_multiple_of(4));
+        for id in titles.chain(more) {
             if id == 0 {
                 continue;
             }

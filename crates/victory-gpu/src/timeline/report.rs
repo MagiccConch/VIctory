@@ -82,6 +82,16 @@ impl Threads {
         threads.ticks = super::record::ticks();
         threads
     }
+
+    /// The threads with no name that start below the system's and our own
+    /// code (the title's), for the sampler.
+    pub(super) fn unnamed_low(&self) -> Vec<u32> {
+        self.all
+            .iter()
+            .filter(|(_, (_, name, start))| name.is_empty() && *start != 0 && *start >> 40 < 0x7f)
+            .map(|(&id, _)| id)
+            .collect()
+    }
 }
 
 /// Names of addresses.
