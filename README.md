@@ -1,5 +1,13 @@
 # playablegames-peppa
 
+**The world works on NVIDIA at nearly 20 fps, confirmed on an RTX 5080
+(2026-11-27).** This tree runs the title's own executable,
+`game_scarlett_master.exe` (build 1.0.2.1), from a save into the open world,
+in-game and playable with a controller: 18.7 fps held over a 12 minute run
+standing in a house interior, and 20.2 fps with one experimental switch.
+Outdoors on foot it is slower, about 11 fps when last measured. Figures, method
+and known faults are under [Where it stands](#where-it-stands-2026-11-27).
+
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
 that runs an Xbox Series title natively on Windows from files the user supplies.
 It carries [fxceless/victory-fork](https://github.com/fxceless/victory-fork)
