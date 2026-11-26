@@ -15,6 +15,14 @@ mod warm;
 
 use std::path::PathBuf;
 
+// Select the app-local Agility SDK on Windows 10 for Shader Model 6.6.
+#[cfg(windows)]
+#[unsafe(no_mangle)]
+pub static D3D12SDKVersion: u32 = 620;
+#[cfg(windows)]
+#[unsafe(no_mangle)]
+pub static D3D12SDKPath: &[u8; 9] = b".\\D3D12\\\0";
+
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 
