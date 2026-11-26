@@ -372,12 +372,20 @@ fn sample() {
         Vec::new()
     };
     tracing::info!(threads = others.len(), "the sampler also looks at the title's other threads (VICTORY_TIMELINE_ALL)");
+    // `VICTORY_TIMELINE_FAST=<name>`: the threads whose name begins so are
+    // looked at every round (four times as often as the others), for a
+    // profile of one busy thread of ours.
+    let fast: Vec<u32> = match std::env::var("VICTORY_TIMELINE_FAST") {
+        Ok(name) if !name.is_empty() => super::report::Threads::now().named(&name),
+        _ => Vec::new(),
+    };
+    let others: Vec<u32> = others.into_iter().filter(|id| !fast.contains(id)).collect();
     let mut round = 0u32;
     while on() {
         round = round.wrapping_add(1);
         let titles = TITLES.iter().map(|place| place.load(Ordering::Relaxed));
         let more = others.iter().copied().filter(|_| round.is_multiple_of(4));
-        for id in titles.chain(more) {
+        for id in titles.chain(fast.iter().copied()).chain(more) {
             if id == 0 {
                 continue;
             }

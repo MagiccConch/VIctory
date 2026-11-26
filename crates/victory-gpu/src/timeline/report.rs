@@ -86,6 +86,11 @@ impl Threads {
     /// The threads with no name that start in the title's own images (the
     /// modules the loader names `victory-image-...`), and our relay, submitting,
     /// records and list threads, for the sampler.
+    /// The threads whose name begins with `name`.
+    pub(super) fn named(&self, name: &str) -> Vec<u32> {
+        self.all.iter().filter(|(_, (_, n, _))| n.starts_with(name)).map(|(&id, _)| id).collect()
+    }
+
     pub(super) fn unnamed_title(&self) -> Vec<u32> {
         self.all
             .iter()
