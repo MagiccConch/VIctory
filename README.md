@@ -12,9 +12,9 @@ and 20.2 fps with one experimental switch.
 | The game starts, first frame, main menu | Works |
 | In the world, from a save | Works |
 | Playable with a controller | Works: a 55 minute session without a crash |
-| Frame rate | 18.7 fps over 12 minutes in a house interior (20.2 with one experimental switch); the goal is 30 |
-| Picture | Lit and whole, with known faults |
-| Ray tracing | Off |
+| Performance | 18.7 fps average over 12 minutes in a house interior, on a named PC: RTX 5080 16 GB, Ryzen 7 5700X3D, 32 GB RAM, Windows 11 (20.2 with one experimental switch); the goal is 30 |
+| Rendering | Lit and whole, with known faults; ray tracing is off |
+| Stability | A 55 minute session without a crash; a night of 61 scripted runs with no lost device and no driver error; memory flat at about 26 GB |
 
 That is on an NVIDIA RTX 5080 with 32 GB of RAM. Figures, method and known
 faults: [Where it stands](#where-it-stands-2026-11-27).
