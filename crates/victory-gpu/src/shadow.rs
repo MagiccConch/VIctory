@@ -314,13 +314,16 @@ static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 /// those alone, not at every copy. It ran once a submission over all of
 /// them (3,400 in the house test, 22 submissions a frame), 3% of the
 /// submitting thread there, which is the frame's wall (run S16).
-static CARDED_AT: Mutex<std::collections::BTreeMap<usize, std::sync::Weak<Shadow>>> = Mutex::new(std::collections::BTreeMap::new());
+/// (Each with the title addresses it holds, start and end, so that
+/// [`send_copied`] upgrades only the copies that hold the bytes.)
+static CARDED_AT: Mutex<std::collections::BTreeMap<usize, (usize, usize, std::sync::Weak<Shadow>)>> = Mutex::new(std::collections::BTreeMap::new());
 static TOUCHED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 /// `shadow`, a copy in the card's memory, is one of [`CARDED`].
 fn carded(shadow: &Arc<Shadow>) {
     CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(shadow));
-    CARDED_AT.lock().unwrap_or_else(|e| e.into_inner()).insert(Arc::as_ptr(shadow) as usize, Arc::downgrade(shadow));
+    let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
+    CARDED_AT.lock().unwrap_or_else(|e| e.into_inner()).insert(Arc::as_ptr(shadow) as usize, (start, end, Arc::downgrade(shadow)));
 }
 
 /// Since the last frame line: bytes copied to card sides and the ranges
@@ -635,7 +638,7 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
     static CALLS: AtomicU64 = AtomicU64::new(0);
     if CALLS.fetch_add(1, Ordering::Relaxed).is_multiple_of(512) {
         CARDED.lock().unwrap_or_else(|e| e.into_inner()).retain(|weak| weak.strong_count() > 0);
-        CARDED_AT.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, weak| weak.strong_count() > 0);
+        CARDED_AT.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, (_, _, weak)| weak.strong_count() > 0);
     }
     let touched = std::mem::take(&mut *TOUCHED.lock().unwrap_or_else(|e| e.into_inner()));
     // The scan of every copy, as before, in the in-run A/B
@@ -651,7 +654,7 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
     }
     let shadows: Vec<Arc<Shadow>> = {
         let at = CARDED_AT.lock().unwrap_or_else(|e| e.into_inner());
-        touched.iter().filter_map(|address| at.get(address)?.upgrade()).collect()
+        touched.iter().filter_map(|address| at.get(address)?.2.upgrade()).collect()
     };
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
     for shadow in shadows {
@@ -755,7 +758,16 @@ pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
 /// CPU side held the same before or not. Left out is what shaders in the air
 /// may be writing (such a copy waits for them, or is done on the card).
 pub(crate) fn send_copied(dst: usize, len: usize) {
-    for shadow in carded_copies() {
+    // Only the copies that hold some of the bytes are upgraded (it was every
+    // copy in the card's memory, 3,400 in the house test, each call).
+    let holding: Vec<Arc<Shadow>> = CARDED_AT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .filter(|(start, end, _)| dst < *end && dst + len > *start)
+        .filter_map(|(_, _, weak)| weak.upgrade())
+        .collect();
+    for shadow in holding {
         let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
         let (from, to) = (dst.max(start), (dst + len).min(end));
         if from >= to {
