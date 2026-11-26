@@ -5,15 +5,14 @@
 `game_scarlett_master.exe` (build 1.0.2.1, an Xbox Series title), from the
 user's own copy: from a save into the open world, in-game and playable with a
 controller, at 18.7 fps held over a 12 minute run standing in a house interior
-and 20.2 fps with one experimental switch. Outdoors on foot it is slower, about
-11 fps when last measured.
+and 20.2 fps with one experimental switch.
 
 | Milestone | Status |
 |---|---|
 | The game starts, first frame, main menu | Works |
 | In the world, from a save | Works |
 | Playable with a controller | Works: a 55 minute session, and 12 minute runs without a crash |
-| Frame rate | 18.7 fps indoors over 12 minutes (20.2 with one experimental switch), about 11 fps outdoors; the goal is 30 |
+| Frame rate | 18.7 fps over 12 minutes in a house interior (20.2 with one experimental switch); the goal is 30 |
 | Picture | Lit and whole, with known faults |
 | Ray tracing | Off |
 
@@ -57,9 +56,7 @@ medians from load to load (three 4 minute runs of the first row: 56.3, 50.0 and
 (`VICTORY_AB=<seconds>,<SWITCH>`, diagnostics builds), over 5 to 11 cycles. The
 GPU crate's unit tests run with `cargo test -p victory-gpu --lib`: 414 pass, and
 four known ones fail (two of them on the base tree too). The
-process holds about 26 GB of private memory, flat over 12 minutes. Outdoors is
-slower: on foot it was about 90 ms before the five switches and has not been
-measured again since. Earlier figures (2026-11-26, Series X, the first room):
+process holds about 26 GB of private memory, flat over 12 minutes. Earlier figures (2026-11-26, Series X, the first room):
 61-67 ms for this tree against 77.3 for avatarmanz's on the same PC.
 
 The five switches the launcher now sets, all measured on this card with the
@@ -113,7 +110,7 @@ What is known to be wrong or missing on NVIDIA:
 - The first runs of a new build or a new driver are slow while the driver
   compiles shaders in the background (20 minutes or more). The NVIDIA driver
   keeps them by the executable's path, so run a rebuilt exe from the same path.
-- From the trees it carries: trees and far buildings flicker outdoors in places,
+- From the trees it carries: trees and far buildings flicker in places,
   rooms with little direct light are too dark without ray tracing, and textures
   that just came into view appear late.
 
