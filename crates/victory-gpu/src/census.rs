@@ -121,6 +121,21 @@ pub(crate) fn skip_back(declared: (usize, usize), bytes: u64) -> bool {
     if !skip_wc_back() {
         return false;
     }
+    // `VICTORY_SKIP_WC_KEEP=<bytes>` (with the experiment): declared ranges
+    // of at most that many bytes are still fetched back, for the small
+    // results the title reads on the CPU (the picture went black without
+    // them: exposure, likely). 0 (the default): none kept.
+    static KEEP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let keep = *KEEP.get_or_init(|| std::env::var("VICTORY_SKIP_WC_KEEP").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    if declared.1.saturating_sub(declared.0) <= keep {
+        return false;
+    }
+    // In the in-run A/B (diagnostics builds; the variable must still be set,
+    // for the reservations to be known): off, everything is fetched again.
+    #[cfg(feature = "diagnostics")]
+    if crate::ab::pick("VICTORY_SKIP_WC_BACK") == Some(false) {
+        return false;
+    }
     let wc = all_wc(&[declared]);
     if wc {
         use std::sync::atomic::Ordering;
