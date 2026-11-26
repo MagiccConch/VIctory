@@ -974,6 +974,8 @@ fn a_parked_pair_another_save_or_restore_shares_stays_two_scalars() {
         assert!(instructions(&p, "s_mov_b64").is_empty(), "{name}");
         assert!(!instructions(&p, "s_mov_b32").is_empty(), "{name}");
     }
+}
+
 /// A barrier entered by only part of a console wave must complete on a
 /// wave32 GPU without disabling uniform barriers or translation-added sync.
 #[test]

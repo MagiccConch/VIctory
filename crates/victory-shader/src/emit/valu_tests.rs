@@ -2145,7 +2145,10 @@ fn build_table_typed_cs(body: &[u32], used: Vec<UsedResource>) -> HostShader {
 /// patterns with `buffer_load_format_d16_xyzw` and `buffer_store_format_d16_xyzw`.
 /// Verify bit-exact round-trips for UINT, SINT, and FLOAT views (including
 /// non-zero table offsets matching dynamic descriptor snapshots) on hardware
-/// GPU and WARP.
+/// GPU and WARP. Such a program moves halves (`HostShader::half_views`, the
+/// port of fxceless #927): it asks no view kinds, and the host shows it a
+/// float or signed view of those places as an unsigned one
+/// (`descriptor::host::half_view`), as this test does.
 #[test]
 fn typed_d16_table_uav_roundtrip_uint_sint_and_float() {
     use windows::Win32::Graphics::Dxgi::Common::{
@@ -2185,8 +2188,13 @@ fn typed_d16_table_uav_roundtrip_uint_sint_and_float() {
         .collect();
     let shader = build_table_typed_cs(&body, used);
     assert!(
-        shader.root_srvs.contains(&super::SLOT_TABLE_STRIDES),
-        "table typed d16 shader should request SLOT_TABLE_STRIDES"
+        shader.half_views.contains(&(0, 0)) && shader.half_views.contains(&(0, 8)),
+        "the program names the two places it moves halves through: {:?}",
+        shader.half_views
+    );
+    assert!(
+        !shader.root_srvs.contains(&super::SLOT_TABLE_STRIDES),
+        "a program that moves halves asks no view kinds of its table"
     );
     assert!(
         !shader.root_srvs.contains(&super::SLOT_STRIDES),
@@ -2229,20 +2237,18 @@ fn typed_d16_table_uav_roundtrip_uint_sint_and_float() {
         let (root, pso) = host
             .compute_pipeline(&shader)
             .unwrap_or_else(|e| panic!("{backend}: compute_pipeline failed: {e}"));
-        for &(label, format, stride_word, input, base_slot) in &cases {
+        for &(label, _, _, input, base_slot) in &cases {
+            // As the host shows them: the float and signed views of places
+            // the program moves halves through, as unsigned ones.
+            let format = DXGI_FORMAT_R16G16B16A16_UINT;
             let mut views = Vec::new();
-            let mut strides = Vec::new();
             for _ in 0..base_slot {
                 views.push(View::RawUav(1));
-                strides.push(0u32);
             }
             let uav_base = base_slot as usize;
             views.push(View::TypedUav { data: input, format, elem_bytes: 8 });
-            strides.push(stride_word);
             views.push(View::TypedUav { data: &zeros, format, elem_bytes: 8 });
-            strides.push(stride_word);
             views.push(View::RawUav(8));
-            strides.push(1);
 
             let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
             for u in &shader.user_data {
@@ -2255,10 +2261,7 @@ fn typed_d16_table_uav_roundtrip_uint_sint_and_float() {
                     &root,
                     &pso,
                     &Dispatch {
-                        roots: vec![
-                            (0, Root::Constants(ud)),
-                            (1, Root::View { srv: true, data: strides }),
-                        ],
+                        roots: vec![(0, Root::Constants(ud))],
                         views: &views,
                         samplers: &[],
                         groups: [1, 1, 1],
