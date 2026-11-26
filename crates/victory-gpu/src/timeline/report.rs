@@ -84,8 +84,8 @@ impl Threads {
     }
 
     /// The threads with no name that start in the title's own images (the
-    /// modules the loader names `victory-image-...`), and our relay, submitting
-    /// and records threads, for the sampler.
+    /// modules the loader names `victory-image-...`), and our relay, submitting,
+    /// records and list threads, for the sampler.
     pub(super) fn unnamed_title(&self) -> Vec<u32> {
         self.all
             .iter()
@@ -93,6 +93,7 @@ impl Threads {
                 name.is_empty() && *start != 0 && Names::module(*start).0.starts_with("victory-image-")
                     || ["victory-relay", "victory-submit"].contains(&name.as_str())
                     || name.starts_with("victory-records")
+                    || name.starts_with("victory-list")
             })
             .map(|(&id, _)| id)
             .collect()
