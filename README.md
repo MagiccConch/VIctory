@@ -7,27 +7,76 @@ and [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)
 (speed on AMD RDNA 3), with fixes for NVIDIA cards and 32 GB of RAM on top.
 
 **AMD and NVIDIA cards are both supported**: the AMD work this tree carries is
-kept. **For now, all testing and new work here is on NVIDIA.** The goal is 40 ms
-a frame (25 fps) in the world on an RTX 5080, with frame generation covering the
-rest. AMD results and fixes are welcome, but they are not tested here.
+kept. **For now, all testing and new work here is on NVIDIA.** The goal is 30
+real frames a second (a 33 ms frame) in the world on an RTX 5080. AMD results and
+fixes are welcome, but they are not tested here.
 
 **This repository contains no game files, code or assets.** You need your own
 copy of the game. It is not affiliated with or endorsed by the game's developer
 or publisher.
 
-## Where it stands (2026-11-26)
+## Where it stands (2026-11-27)
 
 Measured on one PC: Windows 11, RTX 5080 16 GB (driver 621.24), Ryzen 7 5700X3D,
-32 GB RAM, 1080p, Series X profile, in the first room from a save, after the
-driver had finished compiling shaders. One run per row so far; repeats are next.
+32 GB RAM. Series S profile, the title's own upscaler at 2/3 scale (720p drawn,
+1080p shown), ray tracing left out. Loaded from a save into a house interior
+(about 5,200 draws a frame), the character standing, a button pressed every 10 s
+so the title keeps its gameplay camera, frames counted from 110 s after launch,
+after the driver had finished compiling shaders.
 
-| Build and settings | ms a frame |
-|---|---|
-| This tree, `scripts\play.ps1 -Safe`'s switches + `VICTORY_JOIN_PARTS=8 VICTORY_CARD_BUFFERS_MIN_KB=64 VICTORY_CARD_BUFFERS_MB=2048` | 66.5 (65.0-67.9) |
-| This tree, `Play-VIctory.cmd`'s switches (thin recording on) + `VICTORY_CARD_BUFFERS_MB=2048` | 61-67 in the room |
-| avatarmanz/VIctory-7900XTX, the first row's switches, same PC | 77.3 |
+| Build and settings | ms a frame (median) | fps |
+|---|---|---|
+| This tree with `Play-VIctory.cmd`'s settings, a 12 minute run | 53.5 (p10 51.2, p90 55.5) | 18.7 |
+| The same + `VICTORY_SKIP_WC_BACK=1 VICTORY_SKIP_WC_KEEP=65536` (an experiment, see below), a 12 minute run | 49.5 (p10 46.9, p90 52.2) | 20.2 |
+| The same code before the five switches and the 2026-11-27 changes (pull requests 1, 2 and 4), four runs | 68-113 | 9-15 |
+| The tree as it was on 2026-11-25 (Series S with the title's FidelityFX upscaler), two runs | 138.0, 138.8 | 7.2 |
+
+How to read these. They are one PC's figures. The same build lands on different
+medians from load to load (three 4 minute runs of the first row: 56.3, 50.0 and
+58.2 ms), so each switch was judged inside one run, flipped every 10 s
+(`VICTORY_AB=<seconds>,<SWITCH>`, diagnostics builds), over 5 to 11 cycles. The
+process holds about 26 GB of private memory, flat over 12 minutes. Outdoors is
+slower: on foot it was about 90 ms before the five switches and has not been
+measured again since. Earlier figures (2026-11-26, Series X, the first room):
+61-67 ms for this tree against 77.3 for avatarmanz's on the same PC.
+
+The five switches the launcher now sets, all measured on this card with the
+in-run A/B:
+
+| Switch | What it does | Effect |
+|---|---|---|
+| `VICTORY_BURY_ASIDE=1` | Host objects that waited for a flight are dropped on a thread of their own, not on the thread that tells the title the card is done | -23 ms mean |
+| `VICTORY_FILL_TITLE=2` | Small constant fills do not wait for copy-back when no shader wrote that page in the last 600 frames (a constant a shader does write there could be read one flight late; none seen) | -11 ms |
+| `VICTORY_PORT_GUARD=1` | The write guards' lock is shared by faults and refreshes | -3 to -4 ms |
+| `VICTORY_LAND_ASIDE=1` | Landed lists are reset on a thread of their own | -2 to -4 ms |
+| `VICTORY_PLACED_ORDER=1` | A copy at its place in a list holds back the card's steps only if they stand behind it, not the whole submission | -2 ms |
+
+`VICTORY_SKIP_WC_BACK=1` with `VICTORY_SKIP_WC_KEEP=65536` leaves what shaders
+wrote to write-combining title memory on the card, except ranges up to 64 KiB
+(the title reads its exposure back from such a range). It is an experiment: where
+the title's CPU code writes part of a piece the card wrote, stale bytes could go
+up. Twelve minutes of captures showed no fault. Without the second switch the
+picture is wrong (overexposed, blocks).
+
+What sets the frame now: one thread of ours, the one that prepares each
+submission of the title's work for the card. It is busy the whole frame, and the
+title, the list threads and the card (about 18 of 55 ms) all wait for it. Tried
+on this card without a gain, so that nobody has to again: `VICTORY_PORT_CONSTANTS`
+(the card then reads the constants over the bus: 126 ms a frame),
+`VICTORY_PORT_DESCRIPTORS`, a thin-LTO AVX2 build, 6 or 12 list threads instead
+of 8, `VICTORY_LANE_CORE`, `VICTORY_CARD_BUFFERS_MIN_KB=256`.
 
 What is known to be wrong or missing on NVIDIA:
+
+- The same room loads bright in one run and dark in the next, in every build
+  measured, the 2026-11-25 tree included. The title's own exposure settles on a
+  different level each load (its read-back shows it); no cause on this side has
+  been found yet.
+- Every run logs a few hundred "title slot past the host heap" warnings: NVIDIA
+  caps a view heap at 1,000,000 slots, the title's has 1,245,184, and 250,000 of
+  them are fitted in place. `VICTORY_DYNAMIC_SLOTS=262144` goes back to about
+  738,000 fitted and the warnings stop; the picture and the frame time were the
+  same in two runs.
 
 - Four compute programs written for 64-lane waves have no form for NVIDIA's
   32-lane waves and are left out (about one dispatch a frame each). What they
@@ -61,10 +110,12 @@ $env:VICTORY_GAME_DIR = 'D:\Games\MyDump'    # your own dump, outside this folde
 .\Play-VIctory.cmd pareto-residency
 ```
 
-The launcher picks the Series S profile and settings tested on RTX cards, and
-keeps its shader cache under `%LOCALAPPDATA%\VIctory\cache-pareto`. If the
-title's own watchdog ends a run (it can while frames are slow),
-set `VICTORY_NO_WATCHDOG=1` first.
+The launcher picks the Series S profile and the settings the figures above were
+measured with (the title's own upscaler at 2/3 scale, the five switches, card
+buffers and pipeline settings from the RTX 4080 recipe in avatarmanz's issue
+143), and keeps its shader cache under `%LOCALAPPDATA%\VIctory\cache-pareto`. A
+setting you set yourself before starting it wins. If the title's own watchdog
+ends a run (it can while frames are slow), set `VICTORY_NO_WATCHDOG=1` first.
 
 The diagnostics build and avatarmanz's launcher work too:
 
@@ -109,6 +160,21 @@ Results, bug reports and pull requests are all welcome.
 - **Added here**: an opt-in hook for the title's watchdog (`VICTORY_NO_WATCHDOG=1`,
   build 1.0.2.1), and 64 MB stacks for the pipeline workers, since NVIDIA's
   compiler overflowed the default 2 MB on a world compute program.
+- **Added here on 2026-11-26 and 27**, each from someone's public work and
+  named in its commit: avatarmanz's 25 commits after the base (heap records read
+  in place, uploads on a copy queue, pooled textures); from
+  trustno1-coder/VIctory-NVIDIA the title's own upscaler and render scale on
+  every profile, faces that move (its port of fxceless pull request 927 by
+  tippythetaidum), the intro video fix and the choice of card; avatarmanz pull
+  requests 24 (UwUCammie), 42 (gomeaw), 82 (sawetco), 96 and 97 (kalijerry), 105,
+  107 and 108 (SousaTrashBin), 109 (rivaldodev), 114 (secure-silicon) and 119
+  (ESAT586); fxceless pull requests 868 (Chipsraine: the census and the
+  write-combining copy-back experiment), 1224 (Steenax6: `VICTORY_BURY_ASIDE`)
+  and 1146 (beamdotdev: `VICTORY_LAND_ASIDE`); avatarmanz's renderer patches
+  (`VICTORY_PORT_CONSTANTS`, `VICTORY_PORT_DESCRIPTORS`, `VICTORY_PORT_GUARD`).
+  Written here: the card copies' scans narrowed to the copies touched,
+  `VICTORY_SKIP_WC_KEEP`, and timeline diagnostics that sample every thread
+  (`VICTORY_TIMELINE_ALL`, `VICTORY_TIMELINE_FAST`).
 - **From avatarmanz/VIctory-7900XTX**, in short (the reasons and measurements are
   in [docs/findings.md](docs/findings.md)): list calls written down on the
   title's threads and translated on eight of ours (`VICTORY_THIN`); submissions
@@ -132,6 +198,14 @@ commits taken from elsewhere name the commit and its author.
   of the forks below.
 - **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**: the fork
   avatarmanz started from, and the people whose pull requests it carries.
+- **[trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA)**:
+  NVIDIA work on avatarmanz's tree (render scale, own upscaler, faces, the intro
+  video), with patches it took from vitutu1's victory-perf and ZigZagBoi1's
+  ScarlettPort.
+- **Proudnoob4**, for the RTX 4080 recipe in avatarmanz's issue 143, which named
+  most of the pull requests brought in here; and their authors: UwUCammie, gomeaw,
+  sawetco, kalijerry, SousaTrashBin, rivaldodev, secure-silicon, ESAT586,
+  Chipsraine, Steenax6, beamdotdev, tippythetaidum.
 - **[DexNom/VIctory](https://github.com/DexNom/VIctory)**: ray tracing fixes,
   cube gradients, sparse textures.
 - **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**:
