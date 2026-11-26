@@ -270,22 +270,29 @@ mod tests {
         let read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         let cmds = &list.list;
         unsafe {
-            cmds.ClearRenderTargetView(host.rtv(Some(&base), None), &[0.5, 0.0, 0.0, 1.0], None);
-            let overlay_rtv = host.rtv(Some(&overlay), None);
+            // Render-target views from this thread's own slots, used as they
+            // are made (the form since avatarmanz pull request 42, as
+            // compose itself does): the list copies a view as it records.
+            host.output_views(|output| {
+                cmds.ClearRenderTargetView(output.rtv(Some(&base), None), &[0.5, 0.0, 0.0, 1.0], None);
+            });
             let colors = [
                 [0.0, 0.0, 0.0, 0.0],
                 [0.0, 0.5, 0.0, 0.5],
                 [0.0, 0.0, 1.0, 1.0],
             ];
-            for (i, color) in colors.iter().enumerate() {
-                let rect = windows::Win32::Foundation::RECT {
-                    left: i as i32,
-                    right: i as i32 + 1,
-                    top: 0,
-                    bottom: 1,
-                };
-                cmds.ClearRenderTargetView(overlay_rtv, color, Some(&[rect]));
-            }
+            host.output_views(|output| {
+                let overlay_rtv = output.rtv(Some(&overlay), None);
+                for (i, color) in colors.iter().enumerate() {
+                    let rect = windows::Win32::Foundation::RECT {
+                        left: i as i32,
+                        right: i as i32 + 1,
+                        top: 0,
+                        bottom: 1,
+                    };
+                    cmds.ClearRenderTargetView(overlay_rtv, color, Some(&[rect]));
+                }
+            });
             cmds.ResourceBarrier(&[
                 crate::host::transition(&base, target, read),
                 crate::host::transition(&overlay, target, read),
