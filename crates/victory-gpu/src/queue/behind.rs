@@ -620,7 +620,14 @@ const JOINED: usize = 10;
 /// (`VICTORY_SUBMIT_DEPTH`; 64: about two frames of the title's).
 fn runs_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
-    *MOST.get_or_init(|| number("VICTORY_SUBMIT_DEPTH").unwrap_or(64).max(1))
+    let most = *MOST.get_or_init(|| number("VICTORY_SUBMIT_DEPTH").unwrap_or(64).max(1));
+    // With a frame more in the line (`VICTORY_SUBMIT_FRAMES` in the in-run
+    // A/B), room for its submissions too.
+    #[cfg(feature = "diagnostics")]
+    if crate::ab::pick("VICTORY_SUBMIT_FRAMES") == Some(true) {
+        return most * 2;
+    }
+    most
 }
 
 /// How many presents may be in the line when a present call returns
@@ -628,7 +635,13 @@ fn runs_most() -> usize {
 /// 0: both are).
 fn frames_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
-    *MOST.get_or_init(|| number("VICTORY_SUBMIT_FRAMES").unwrap_or(1))
+    let most = *MOST.get_or_init(|| number("VICTORY_SUBMIT_FRAMES").unwrap_or(1));
+    // In the in-run A/B (diagnostics builds): on, one frame more than set.
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_SUBMIT_FRAMES") {
+        return if on { most + 1 } else { most };
+    }
+    most
 }
 
 fn number(name: &str) -> Option<usize> {
