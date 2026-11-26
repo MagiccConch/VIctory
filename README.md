@@ -11,7 +11,7 @@ and 20.2 fps with one experimental switch.
 |---|---|
 | The game starts, first frame, main menu | Works |
 | In the world, from a save | Works |
-| Playable with a controller | Works: a 55 minute session, and 12 minute runs without a crash |
+| Playable with a controller | Works: a 55 minute session without a crash |
 | Frame rate | 18.7 fps over 12 minutes in a house interior (20.2 with one experimental switch); the goal is 30 |
 | Picture | Lit and whole, with known faults |
 | Ray tracing | Off |
