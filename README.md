@@ -1,8 +1,9 @@
 # playablegames-peppa
 
 **The game's world works on NVIDIA at nearly 20 fps, confirmed on an RTX 5080
-(2026-11-27).** This tree runs the game, an Xbox Series title, from the user's
-own copy: from a save into the open world, in-game and playable with a
+(2026-11-27).** This tree runs the game's own executable,
+`game_scarlett_master.exe` (build 1.0.2.1, an Xbox Series title), from the
+user's own copy: from a save into the open world, in-game and playable with a
 controller, at 18.7 fps held over a 12 minute run standing in a house interior
 and 20.2 fps with one experimental switch. Outdoors on foot it is slower, about
 11 fps when last measured.
