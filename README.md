@@ -12,6 +12,7 @@ and 20.2 fps with one experimental switch.
 | The game starts, first frame, main menu | Works |
 | In the world, from a save | Works |
 | Playable with a controller | Works: a 55 minute session without a crash |
+| Story progress | First missions: the first mission completed, side tasks completed, and driving around the world by day and by night (the owner's own play) |
 | Performance | 18.7 fps average over 12 minutes in a house interior, on a named PC: RTX 5080 16 GB, Ryzen 7 5700X3D, 32 GB RAM, Windows 11 (20.2 with one experimental switch); the goal is 30 |
 | Rendering | Lit and whole, with known faults; ray tracing is off |
 | Stability | A 55 minute session without a crash; a night of 61 scripted runs with no lost device and no driver error; memory flat at about 26 GB |
