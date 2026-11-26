@@ -1,12 +1,23 @@
 # playablegames-peppa
 
-**The world works on NVIDIA at nearly 20 fps, confirmed on an RTX 5080
-(2026-11-27).** This tree runs the title's own executable,
-`game_scarlett_master.exe` (build 1.0.2.1), from a save into the open world,
-in-game and playable with a controller: 18.7 fps held over a 12 minute run
-standing in a house interior, and 20.2 fps with one experimental switch.
-Outdoors on foot it is slower, about 11 fps when last measured. Figures, method
-and known faults are under [Where it stands](#where-it-stands-2026-11-27).
+**The game's world works on NVIDIA at nearly 20 fps, confirmed on an RTX 5080
+(2026-11-27).** This tree runs the game, an Xbox Series title, from the user's
+own copy: from a save into the open world, in-game and playable with a
+controller, at 18.7 fps held over a 12 minute run standing in a house interior
+and 20.2 fps with one experimental switch. Outdoors on foot it is slower, about
+11 fps when last measured.
+
+| Milestone | Status |
+|---|---|
+| The game starts, first frame, main menu | Works |
+| In the world, from a save | Works |
+| Playable with a controller | Works: a 55 minute session, and 12 minute runs without a crash |
+| Frame rate | 18.7 fps indoors over 12 minutes (20.2 with one experimental switch), about 11 fps outdoors; the goal is 30 |
+| Picture | Lit and whole, with known faults |
+| Ray tracing | Off |
+
+That is on an NVIDIA RTX 5080 with 32 GB of RAM. Figures, method and known
+faults: [Where it stands](#where-it-stands-2026-11-27).
 
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
 that runs an Xbox Series title natively on Windows from files the user supplies.
@@ -43,6 +54,8 @@ How to read these. They are one PC's figures. The same build lands on different
 medians from load to load (three 4 minute runs of the first row: 56.3, 50.0 and
 58.2 ms), so each switch was judged inside one run, flipped every 10 s
 (`VICTORY_AB=<seconds>,<SWITCH>`, diagnostics builds), over 5 to 11 cycles. The
+GPU crate's unit tests run with `cargo test -p victory-gpu --lib`: 414 pass, and
+four known ones fail (two of them on the base tree too). The
 process holds about 26 GB of private memory, flat over 12 minutes. Outdoors is
 slower: on foot it was about 90 ms before the five switches and has not been
 measured again since. Earlier figures (2026-11-26, Series X, the first room):
