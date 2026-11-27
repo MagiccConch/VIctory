@@ -646,8 +646,33 @@ fn unwind(context: CONTEXT) -> Vec<u64> {
     // SAFETY: writes the current thread's stack bounds.
     unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };
     let mut frames = Vec::with_capacity(MAX_FRAMES);
-    unwind_into(context, low, high, &mut frames);
+    unwind_into(context, low, high, false, &mut frames);
     frames
+}
+
+/// Bases of the images whose unwind data a walk of another thread's stack
+/// follows ([`unwind_into`] with `trusted_only`): ours and the system's
+/// own. Read once, by [`trust_images`], before any thread is suspended
+/// (looking a module up may take the loader's lock).
+static TRUSTED: std::sync::OnceLock<[usize; 4]> = std::sync::OnceLock::new();
+
+/// Fills [`TRUSTED`]; call it while no thread of ours is suspended.
+pub(crate) fn trust_images() {
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    TRUSTED.get_or_init(|| {
+        let of = |name: &str| {
+            let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+            // SAFETY: a NUL-terminated name; no reference is taken.
+            unsafe { GetModuleHandleW(wide.as_ptr()) as usize }
+        };
+        // SAFETY: null asks for the executable's own module.
+        let own = unsafe { GetModuleHandleW(null_mut()) as usize };
+        [own, of("ntdll.dll"), of("kernel32.dll"), of("kernelbase.dll")]
+    });
+}
+
+fn trusted(image: u64) -> bool {
+    TRUSTED.get().is_some_and(|t| image != 0 && t.contains(&(image as usize)))
 }
 
 /// A `CONTEXT` at the 16-byte alignment the unwind and capture functions need.
@@ -657,7 +682,19 @@ pub(crate) struct Aligned16(pub(crate) CONTEXT);
 /// [`unwind`] for any thread of the process, its stack being `low..high`;
 /// pushes no more than `MAX_FRAMES`, so it does not allocate when `frames`
 /// has that capacity (another thread may be suspended holding the heap).
-pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mut Vec<u64>) {
+///
+/// `trusted_only` (a sampled thread stopped anywhere): the walk ends at the
+/// first frame in an image other than ours and the system's ([`TRUSTED`]),
+/// that frame kept. A profile (`VICTORY_PROFILE`) died in `RtlVirtualUnwind`
+/// reading all ones, following a title image's unwind data from where its
+/// thread had been stopped.
+pub(crate) fn unwind_into(
+    context: CONTEXT,
+    low: usize,
+    high: usize,
+    trusted_only: bool,
+    frames: &mut Vec<u64>,
+) {
     // `RtlVirtualUnwind` writes the context with 16-byte aligned stores, and
     // windows-sys declares `CONTEXT` without that alignment: a by-value copy on
     // the stack can land 8 bytes off and fault (seen in a debug build).
@@ -670,9 +707,22 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
         if rsp < low || rsp + 8 > high {
             break;
         }
+        // The bounds are what the thread's TEB says, and the stack may not be
+        // all there: a profile (`VICTORY_PROFILE`) died in `RtlVirtualUnwind`
+        // reading "reserved, never committed" memory above a sampled thread's
+        // `rsp`. Unwind only through memory that can be read: all of it up to
+        // `high`, or, short of that, a margin for one frame's saved registers.
+        let end = readable_end(rsp, high);
+        if rsp + 8 > end || (end < high && end - rsp < UNWIND_MARGIN) {
+            break;
+        }
         let mut image = 0;
         // SAFETY: looks up the function table entry covering `Rip`, if any.
         let entry = unsafe { RtlLookupFunctionEntry(context.Rip, &mut image, null_mut()) };
+        if trusted_only && !entry.is_null() && !trusted(image) {
+            break;
+        }
+        let before = context.Rsp;
         if entry.is_null() {
             // SAFETY: `rsp` is inside this thread's stack.
             context.Rip = unsafe { (rsp as *const u64).read() };
@@ -696,8 +746,45 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
         if context.Rip == 0 {
             break;
         }
+        // A stopped thread's walk that does not move up its stack is lost.
+        if trusted_only && context.Rsp <= before {
+            break;
+        }
         frames.push(context.Rip);
     }
+}
+
+/// How much readable stack [`unwind_into`] wants above `rsp` to unwind a
+/// frame when the stack is not readable all the way to its base.
+const UNWIND_MARGIN: usize = 0x4000;
+
+/// The end of the committed, readable memory from `at` on, at most `high`.
+/// Asks the address space's bookkeeping only (no allocation, no lock a
+/// suspended thread could hold).
+fn readable_end(at: usize, high: usize) -> usize {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    let mut end = at;
+    // A stack is a region or two; a few more looked at is plenty.
+    for _ in 0..8 {
+        if end >= high {
+            break;
+        }
+        // SAFETY: a zeroed MEMORY_BASIC_INFORMATION is valid.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: reads the address space's bookkeeping, not `end` itself.
+        let n = unsafe { VirtualQuery(end as *const _, &mut info, size_of_val(&info)) };
+        if n == 0
+            || info.State != MEM_COMMIT
+            || info.Protect & (PAGE_GUARD | PAGE_NOACCESS) != 0
+            || info.Protect == 0
+        {
+            break;
+        }
+        end = info.BaseAddress as usize + info.RegionSize;
+    }
+    end.min(high)
 }
 
 /// `module+rva`, or the bare address.

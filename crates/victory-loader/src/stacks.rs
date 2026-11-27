@@ -140,6 +140,8 @@ pub(crate) fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32, usize)) {
         priority: 0,
         base_priority: 0,
     };
+    // Before anything is suspended: it may look modules up.
+    crate::crash::trust_images();
     // Suspended first: a running thread may exit and free its TEB between
     // the query and the read below.
     // SAFETY: a thread of this process that is not this one.
@@ -172,7 +174,7 @@ pub(crate) fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32, usize)) {
     // the unwinder's own.
     unsafe {
         if GetThreadContext(thread, &mut context.0) != 0 {
-            unwind_into(context.0, low, high, &mut frames);
+            unwind_into(context.0, low, high, true, &mut frames);
         }
         ResumeThread(thread);
     }
